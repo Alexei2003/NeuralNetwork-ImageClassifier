@@ -1,14 +1,22 @@
-﻿from tensorflow.keras.layers import Input, Conv2D, MaxPooling2D, Dense, Dropout, BatchNormalization, Activation, GlobalAveragePooling2D, Add
-from tensorflow.keras.preprocessing.image import ImageDataGenerator
-from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
+﻿# model
+from tensorflow.keras.layers import Input, Conv2D, MaxPooling2D, Dense, Dropout, BatchNormalization, Activation, GlobalAveragePooling2D, Add, Reshape, Multiply
+from tensorflow.keras.preprocessing.image import ImageDataGenerator 
 from tensorflow.keras.regularizers import l2
 from tensorflow.keras.models import load_model, Model
-from tensorflow.keras.optimizers import Nadam
+from tensorflow.keras.optimizers import SGD
 
+# notification
 import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # Отключение всех сообщений
+os.environ['XLA_FLAGS'] = '--xla_hlo_profile=false'  # Отключить профилирование XLA
 
-from tensorflow.keras.layers import GlobalAveragePooling2D, Dense, Reshape, Multiply
-from tensorflow.keras import layers
+# params
+from tensorflow.keras.mixed_precision import set_global_policy
+set_global_policy('mixed_float16')
+
+# convert
+import tf2onnx
+import tensorflow as tf
 
 # SE-блок
 def se_block(input_tensor, reduction=16):
@@ -23,7 +31,7 @@ def se_block(input_tensor, reduction=16):
     # Excitation: полносвязные слои для вычисления важности каналов
     se_tensor = Dense(filters // reduction, activation='relu', kernel_regularizer=l2(0.001))(se_tensor)
     se_tensor = Dense(filters, activation='sigmoid', kernel_regularizer=l2(0.001))(se_tensor)
-    
+
     # Масштабирование входного тензора по вычисленным весам
     return Multiply()([input_tensor, se_tensor])
 
@@ -104,7 +112,6 @@ def build_cnn(input_shape, num_classes):
 
     # Полносвязная голова
     x = Dense(1024, kernel_regularizer=l2(0.001))(x)
-    #x = Dense(128, kernel_regularizer=l2(0.001))(x)
     x = BatchNormalization()(x)
     x = Activation('relu')(x)
     x = Dropout(0.5)(x)
@@ -116,26 +123,37 @@ def build_cnn(input_shape, num_classes):
     model = Model(inputs=input_tensor, outputs=output_tensor)
 
     # Компиляция модели
-    optimizer = Nadam(learning_rate=0.001)
+    optimizer = SGD(learning_rate=0.001)
     model.compile(optimizer=optimizer, loss='categorical_crossentropy', metrics=['accuracy'])
 
     model.summary()
     return model
 
-def run():
+
+source_dir = "/media/alex/Programs/NeuralNetwork/DataSet/ARTS/Original"
+checkpoint_model_filename = "/media/alex/Programs/NeuralNetwork/Model/checkpoint_model.keras" 
+def run_learning():
+    """Обучение нейроной сети"""
     # Параметры
-    source_dir = r"DataSet\ARTS\Original"  # Путь к папке с исходными данными
     img_size = (224, 224)  # Размер изображения (224x224)
-    batch_size = 32
-    images_per_epochs_count = 5000  # Текущее количество изображений для обучения
+    batch_size = 5
+    images_per_epochs_count = 10000  # Текущее количество изображений для обучения
     steps_per_epoch = images_per_epochs_count // batch_size
+    steps_per_epoch += 1
     base_epochs = 100
 
-    result_model_filename = r"Model\result_model.keras"
-    checkpoint_model_filename = r"Model\checkpoint_model.keras" 
-
     # Генерация данных
-    datagen = ImageDataGenerator(rescale=1.0 / 255, validation_split=0.2)
+    datagen = ImageDataGenerator(
+        rescale=1.0 / 255,  # Масштабирование пикселей в диапазон [0, 1]
+        validation_split=0.2,  # Разделение данных на обучение и валидацию
+        rotation_range=20,  # Повороты до 20 градусов
+        width_shift_range=0.2,  # Горизонтальное смещение до 20% от ширины
+        height_shift_range=0.2,  # Вертикальное смещение до 20% от высоты
+        shear_range=0.15,  # Сдвиг (shear) до 15%
+        zoom_range=0.2,  # Увеличение или уменьшение масштаба до 20%
+        fill_mode='nearest'  # Заполнение новых пикселей при смещении (nearest, constant, reflect, wrap)
+    )   
+
 
     validation_generator = datagen.flow_from_directory(
         source_dir,
@@ -148,9 +166,9 @@ def run():
     input_shape = (img_size[0], img_size[1], 3)
 
     # Проверяем, существует ли модель и её архитектура
-    if os.path.exists(result_model_filename):
+    if os.path.exists(checkpoint_model_filename):
         print("\nЗагрузка предобученной модели...\n")
-        model = load_model(result_model_filename)
+        model = load_model(checkpoint_model_filename)
     else:
         print("\nСоздание новой модели...\n")
         model = build_cnn(input_shape, len(validation_generator.class_indices))
@@ -168,10 +186,11 @@ def run():
     train_images_count = train_generator.samples # количество изображений для обучения
 
     epochs_per_image_batch = train_images_count // images_per_epochs_count
+    epochs_per_image_batch += 1
 
     # Состояние для ручного early_stopping
     best_val_loss = float('inf')
-    patience = 1 * epochs_per_image_batch
+    patience = 2 * epochs_per_image_batch
     wait = 0
 
     full_epoch = base_epochs * epochs_per_image_batch
@@ -184,7 +203,7 @@ def run():
             train_generator,
             steps_per_epoch=steps_per_epoch,
             validation_data=validation_generator,
-            epochs=1,  # Одна эпоха за раз
+            epochs=1  # Одна эпоха за раз
         )
 
         # Логика ручного early_stopping
@@ -215,9 +234,51 @@ def run():
     test_loss, test_accuracy = model.evaluate(validation_generator)
     print(f"\nРезультаты тестирования:\n - Потери (Loss): {test_loss:.4f}\n - Точность (Accuracy): {test_accuracy:.4f}")
 
-    # Сохранение итоговой модели
-    model.save(result_model_filename)
-    print(f"Модель сохранена в {result_model_filename}")
+labels_path = "/media/alex/Programs/NeuralNetwork/Model/labels.txt" 
+def save_labels():
+    """Сохраняет текстовые метки из директорий классов."""
+    class_names = sorted(os.listdir(source_dir))
+    with open(labels_path, "w") as f:
+        for label in class_names:
+            f.write(label + "\n")
+    print(f"Метки сохранены в {labels_path}")
+    return class_names
+
+onnx_model_filename = "/media/alex/Programs/NeuralNetwork/Model/model.onnx"  # Задайте путь для сохранения ONNX-модели
+def convert_to_onnx():
+    if not tf.io.gfile.exists(checkpoint_model_filename):
+        print("Файл модели не найден.")
+        return
+
+    print("Модель Keras успешно загружена.")
+    model = tf.keras.models.load_model(checkpoint_model_filename)
+
+    print("Начинается процесс конвертации в ONNX...")
+
+    # Убедитесь, что input_signature передается как список
+    spec = [tf.TensorSpec((None, 224, 224, 3), tf.float32, name="input")]
+    onnx_model = tf2onnx.convert.from_keras(model, input_signature=spec, opset=13)[0]
+
+    with open(onnx_model_filename, "wb") as f:
+        f.write(onnx_model.SerializeToString())
+
+    save_labels()
+    print(f"Модель успешно конвертирована и сохранена как {onnx_model_filename}")
 
 
-run()
+def main():
+    print("Выберите действие:")
+    print("1. Обучить модель")
+    print("2. Конвертировать обученную модель в ONNX")
+    
+    choice = input("Введите ваш выбор (1 или 2): ")
+
+    if choice == "1":
+        run_learning()
+    elif choice == "2":
+        convert_to_onnx()
+    else:
+        print("Неверный ввод. Завершение программы.")
+
+
+main()
