@@ -19,6 +19,8 @@ import tensorflow as tf
 import onnxruntime as ort
 import numpy as np
 
+set_global_policy('mixed_float16')
+
 # SE-блок
 def se_block(input_tensor, reduction=16):
     """Добавление Squeeze-and-Excitation блока."""
@@ -61,7 +63,7 @@ def bottleneck_block(input_tensor, filters, stride=1, reduction=16):
     x = BatchNormalization()(x)
 
     # Применяем SE-блок
-    x = se_block(x)
+    x = se_block(x, reduction)
 
     # Добавление shortcut
     x = Add()([x, shortcut])
@@ -134,8 +136,6 @@ source_dir = "/media/alex/Programs/NeuralNetwork/DataSet/ARTS/Original"
 checkpoint_model_filename = "/media/alex/Programs/NeuralNetwork/Model/checkpoint_model.keras" 
 def run_learning():
     """Обучение нейроной сети"""
-
-    set_global_policy('mixed_float16')
 
     # Параметры
     img_size = (224, 224)  # Размер изображения (224x224)
@@ -248,9 +248,7 @@ def save_labels():
 
 onnx_model_filename = "/media/alex/Programs/NeuralNetwork/Model/model.onnx" 
 def load_and_convert_model():
-    """Конввертирует в float32 ONNX"""
-
-    set_global_policy('float32')
+    """Конввертирует в ONNX"""
 
     # Загрузка модели из контрольной точки
     model = load_model(checkpoint_model_filename)
