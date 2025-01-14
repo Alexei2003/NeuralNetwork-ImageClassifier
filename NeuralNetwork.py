@@ -12,11 +12,12 @@ os.environ['XLA_FLAGS'] = '--xla_hlo_profile=false'  # Отключить про
 
 # params
 from tensorflow.keras.mixed_precision import set_global_policy
-set_global_policy('mixed_float16')
 
 # convert
 import tf2onnx
 import tensorflow as tf
+import onnxruntime as ort
+import numpy as np
 
 # SE-блок
 def se_block(input_tensor, reduction=16):
@@ -129,11 +130,13 @@ def build_cnn(input_shape, num_classes):
     model.summary()
     return model
 
-
 source_dir = "/media/alex/Programs/NeuralNetwork/DataSet/ARTS/Original"
 checkpoint_model_filename = "/media/alex/Programs/NeuralNetwork/Model/checkpoint_model.keras" 
 def run_learning():
     """Обучение нейроной сети"""
+
+    set_global_policy('mixed_float16')
+
     # Параметры
     img_size = (224, 224)  # Размер изображения (224x224)
     batch_size = 5
@@ -153,7 +156,6 @@ def run_learning():
         zoom_range=0.2,  # Увеличение или уменьшение масштаба до 20%
         fill_mode='nearest'  # Заполнение новых пикселей при смещении (nearest, constant, reflect, wrap)
     )   
-
 
     validation_generator = datagen.flow_from_directory(
         source_dir,
@@ -244,41 +246,51 @@ def save_labels():
     print(f"Метки сохранены в {labels_path}")
     return class_names
 
-onnx_model_filename = "/media/alex/Programs/NeuralNetwork/Model/model.onnx"  # Задайте путь для сохранения ONNX-модели
-def convert_to_onnx():
-    if not tf.io.gfile.exists(checkpoint_model_filename):
-        print("Файл модели не найден.")
-        return
+onnx_model_filename = "/media/alex/Programs/NeuralNetwork/Model/model.onnx" 
+def load_and_convert_model():
+    """Конввертирует в float32 ONNX"""
 
-    print("Модель Keras успешно загружена.")
-    model = tf.keras.models.load_model(checkpoint_model_filename)
+    set_global_policy('float32')
 
-    print("Начинается процесс конвертации в ONNX...")
+    # Загрузка модели из контрольной точки
+    model = load_model(checkpoint_model_filename)
 
-    # Убедитесь, что input_signature передается как список
-    spec = [tf.TensorSpec((None, 224, 224, 3), tf.float32, name="input")]
-    onnx_model = tf2onnx.convert.from_keras(model, input_signature=spec, opset=13)[0]
+    # Конвертация и сохранение модели в формате ONNX
+    input_signature = [tf.TensorSpec([None, 224, 224, 3], tf.float32)]
+    tf2onnx.convert.from_keras(model, input_signature=input_signature, output_path=onnx_model_filename)
+    test_onnx_model_with_random_tensor()
 
-    with open(onnx_model_filename, "wb") as f:
-        f.write(onnx_model.SerializeToString())
-
-    save_labels()
-    print(f"Модель успешно конвертирована и сохранена как {onnx_model_filename}")
-
-
-def main():
-    print("Выберите действие:")
-    print("1. Обучить модель")
-    print("2. Конвертировать обученную модель в ONNX")
+def test_onnx_model_with_random_tensor():
+    # Загрузка ONNX модели
+    session = ort.InferenceSession(onnx_model_filename)
     
-    choice = input("Введите ваш выбор (1 или 2): ")
+    # Получить имена входов и выходов
+    input_name = session.get_inputs()[0].name
+    output_name = session.get_outputs()[0].name
+    
+    # Создать случайный тензор
+    random_tensor = np.random.rand(1, 224, 224, 3).astype(np.float32)  # Batch size = 1
+    
+    # Прогнать модель с случайным тензором
+    outputs = session.run([output_name], {input_name: random_tensor})
+    
+    # Печать результата
+    print("Результат работы модели со случайным тензором:")
+    print(outputs[0])
+      
+def main():
+    while True:
+        print("\nВыберите действие:")
+        print("1. Обучить модель")
+        print("2. Конвертировать модель в ONNX")
 
-    if choice == "1":
-        run_learning()
-    elif choice == "2":
-        convert_to_onnx()
-    else:
-        print("Неверный ввод. Завершение программы.")
+        choice = input("Введите номер действия (1/2): ")
 
+        if choice == '1':
+            run_learning()
+
+        if choice == '2':
+            load_and_convert_model()
+            save_labels()
 
 main()
