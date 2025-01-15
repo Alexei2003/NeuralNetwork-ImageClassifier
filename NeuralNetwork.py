@@ -4,6 +4,7 @@ from tensorflow.keras.preprocessing.image import ImageDataGenerator
 from tensorflow.keras.regularizers import l2
 from tensorflow.keras.models import load_model, Model
 from tensorflow.keras.optimizers import SGD
+from sklearn.utils.class_weight import compute_class_weight
 
 # notification
 import os
@@ -132,11 +133,8 @@ def build_cnn(input_shape, num_classes):
     model.summary()
     return model
 
-source_dir = "/media/alex/Programs/NeuralNetwork/DataSet/ARTS/Original"
-checkpoint_model_filename = "/media/alex/Programs/NeuralNetwork/Model/checkpoint_model.keras" 
 def run_learning():
     """Обучение нейроной сети"""
-
     # Параметры
     img_size = (224, 224)  # Размер изображения (224x224)
     batch_size = 5
@@ -185,7 +183,15 @@ def run_learning():
         shuffle=True  # Перемешиваем данные
     )
 
-    train_images_count = train_generator.samples # количество изображений для обучения
+    train_images_count = train_generator.samples  # Количество изображений для обучения
+
+    # Вычисляем веса классов
+    class_weights = compute_class_weight(
+        class_weight='balanced',
+        classes=np.unique(train_generator.classes),
+        y=train_generator.classes
+    )
+    class_weights_dict = dict(enumerate(class_weights))
 
     epochs_per_image_batch = train_images_count // images_per_epochs_count
     epochs_per_image_batch += 1
@@ -205,7 +211,8 @@ def run_learning():
             train_generator,
             steps_per_epoch=steps_per_epoch,
             validation_data=validation_generator,
-            epochs=1  # Одна эпоха за раз
+            epochs=1,  # Одна эпоха за раз
+            class_weight=class_weights_dict  # Добавляем веса классов
         )
 
         # Логика ручного early_stopping
