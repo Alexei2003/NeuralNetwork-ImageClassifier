@@ -133,6 +133,8 @@ def build_cnn(input_shape, num_classes):
     model.summary()
     return model
 
+source_dir = "/media/alex/Programs/NeuralNetwork/DataSet/ARTS/Original"
+checkpoint_model_filename = "/media/alex/Programs/NeuralNetwork/Model/checkpoint_model.keras" 
 def run_learning():
     """Обучение нейроной сети"""
     # Параметры
