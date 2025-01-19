@@ -140,7 +140,7 @@ def run_learning():
     # Параметры
     img_size = (224, 224)  # Размер изображения (224x224)
     batch_size = 5
-    images_per_epochs_count = 10000  # Текущее количество изображений для обучения
+    images_per_epochs_count = 30000  # Текущее количество изображений для обучения
     steps_per_epoch = images_per_epochs_count // batch_size
     steps_per_epoch += 1
     base_epochs = 100
@@ -149,11 +149,13 @@ def run_learning():
     datagen = ImageDataGenerator(
         rescale=1.0 / 255,  # Масштабирование пикселей в диапазон [0, 1]
         validation_split=0.2,  # Разделение данных на обучение и валидацию
-        rotation_range=20,  # Повороты до 20 градусов
-        width_shift_range=0.2,  # Горизонтальное смещение до 20% от ширины
-        height_shift_range=0.2,  # Вертикальное смещение до 20% от высоты
+        rotation_range=30,  # Повороты до 30 градусов
+        width_shift_range=0.3,  # Горизонтальное смещение до 30% от ширины
+        height_shift_range=0.3,  # Вертикальное смещение до 30% от высоты
         shear_range=0.15,  # Сдвиг (shear) до 15%
-        zoom_range=0.2,  # Увеличение или уменьшение масштаба до 20%
+        zoom_range=[0.8, 1.2],  # Увеличение или уменьшение масштаба от 80% до 120%
+        brightness_range=[0.8, 1.2],  # Изменение яркости от 80% до 120%
+        horizontal_flip=True,  # Случайное отражение по горизонтали
         fill_mode='nearest'  # Заполнение новых пикселей при смещении (nearest, constant, reflect, wrap)
     )   
 
