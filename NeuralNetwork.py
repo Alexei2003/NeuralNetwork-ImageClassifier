@@ -1,18 +1,15 @@
 ﻿# model
 from tensorflow.keras.layers import Input, Conv2D, MaxPooling2D, Dense, Dropout, BatchNormalization, Activation, GlobalAveragePooling2D, Add, Reshape, Multiply
 from tensorflow.keras.preprocessing.image import ImageDataGenerator 
-from tensorflow.keras.regularizers import l2
+from tensorflow.keras.regularizers import l1_l2
 from tensorflow.keras.models import load_model, Model
 from tensorflow.keras.optimizers import SGD
 from sklearn.utils.class_weight import compute_class_weight
 
-# notification
+# params system
 import os
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # Отключение всех сообщений
-os.environ['XLA_FLAGS'] = '--xla_hlo_profile=false'  # Отключить профилирование XLA
-
-# params
 from tensorflow.keras.mixed_precision import set_global_policy
+set_global_policy('mixed_float16')
 
 # convert
 import tf2onnx
@@ -20,7 +17,10 @@ import tensorflow as tf
 import onnxruntime as ort
 import numpy as np
 
-set_global_policy('mixed_float16')
+#params my
+l1_value = 1e-4
+l2_value = 1e-4
+initial_learning_rate = 1e-4
 
 # SE-блок
 def se_block(input_tensor, reduction=16):
@@ -33,8 +33,8 @@ def se_block(input_tensor, reduction=16):
     se_tensor = Reshape((1, 1, filters))(se_tensor)
     
     # Excitation: полносвязные слои для вычисления важности каналов
-    se_tensor = Dense(filters // reduction, activation='relu', kernel_regularizer=l2(0.001))(se_tensor)
-    se_tensor = Dense(filters, activation='sigmoid', kernel_regularizer=l2(0.001))(se_tensor)
+    se_tensor = Dense(filters // reduction, activation='relu', kernel_regularizer=l1_l2(l1=l1_value, l2=l2_value) )(se_tensor)
+    se_tensor = Dense(filters, activation='sigmoid', kernel_regularizer=l1_l2(l1=l1_value, l2=l2_value) )(se_tensor)
 
     # Масштабирование входного тензора по вычисленным весам
     return Multiply()([input_tensor, se_tensor])
@@ -46,21 +46,21 @@ def bottleneck_block(input_tensor, filters, stride=1, reduction=16):
 
     # Проекционный shortcut (если требуется изменение размерности)
     if shortcut.shape[-1] != filters * 4 or stride > 1:
-        shortcut = Conv2D(filters * 4, (1, 1), strides=stride, padding='same', kernel_regularizer=l2(0.001))(shortcut)
+        shortcut = Conv2D(filters * 4, (1, 1), strides=stride, padding='same', kernel_regularizer=l1_l2(l1=l1_value, l2=l2_value) )(shortcut)
         shortcut = BatchNormalization()(shortcut)
 
     # Слой 1: 1x1 свёртка (уменьшение числа каналов)
-    x = Conv2D(filters, (1, 1), strides=stride, padding='same', kernel_regularizer=l2(0.001))(input_tensor)
+    x = Conv2D(filters, (1, 1), strides=stride, padding='same', kernel_regularizer=l1_l2(l1=l1_value, l2=l2_value) )(input_tensor)
     x = BatchNormalization()(x)
     x = Activation('relu')(x)
 
     # Слой 2: 3x3 свёртка
-    x = Conv2D(filters, (3, 3), padding='same', kernel_regularizer=l2(0.001))(x)
+    x = Conv2D(filters, (3, 3), padding='same', kernel_regularizer=l1_l2(l1=l1_value, l2=l2_value) )(x)
     x = BatchNormalization()(x)
     x = Activation('relu')(x)
 
     # Слой 3: 1x1 свёртка (восстановление размерности)
-    x = Conv2D(filters * 4, (1, 1), padding='same', kernel_regularizer=l2(0.001))(x)
+    x = Conv2D(filters * 4, (1, 1), padding='same', kernel_regularizer=l1_l2(l1=l1_value, l2=l2_value) )(x)
     x = BatchNormalization()(x)
 
     # Применяем SE-блок
@@ -88,7 +88,7 @@ def build_cnn(input_shape, num_classes):
     x = input_tensor
 
     # Начальная свёртка
-    x = Conv2D(64, (7, 7), strides=2, padding='same', kernel_regularizer=l2(0.001))(x)
+    x = Conv2D(64, (7, 7), strides=2, padding='same', kernel_regularizer=l1_l2(l1=l1_value, l2=l2_value) )(x)
     x = BatchNormalization()(x)
     x = Activation('relu')(x)
     x = MaxPooling2D(pool_size=(3, 3), strides=2, padding='same')(x)
@@ -115,7 +115,7 @@ def build_cnn(input_shape, num_classes):
     x = GlobalAveragePooling2D()(x)
 
     # Полносвязная голова
-    x = Dense(1024, kernel_regularizer=l2(0.001))(x)
+    x = Dense(1024, kernel_regularizer=l1_l2(l1=l1_value, l2=l2_value) )(x)
     x = BatchNormalization()(x)
     x = Activation('relu')(x)
     x = Dropout(0.5)(x)
@@ -127,7 +127,7 @@ def build_cnn(input_shape, num_classes):
     model = Model(inputs=input_tensor, outputs=output_tensor)
 
     # Компиляция модели
-    optimizer = SGD(learning_rate=0.001)
+    optimizer = SGD(learning_rate=initial_learning_rate)
     model.compile(optimizer=optimizer, loss='categorical_crossentropy', metrics=['accuracy'])
 
     model.summary()
@@ -173,9 +173,11 @@ def run_learning():
     if os.path.exists(checkpoint_model_filename):
         print("\nЗагрузка предобученной модели...\n")
         model = load_model(checkpoint_model_filename)
+        learning_rate = model.optimizer.learning_rate
     else:
         print("\nСоздание новой модели...\n")
         model = build_cnn(input_shape, len(validation_generator.class_indices))
+        learning_rate = initial_learning_rate
 
     # Пересоздаём train_generator на каждую эпоху
     train_generator = datagen.flow_from_directory(
@@ -202,34 +204,45 @@ def run_learning():
 
     # Состояние для ручного early_stopping
     best_val_loss = float('inf')
-    patience = 2 * epochs_per_image_batch
-    wait = 0
+    consecutive_no_improvement = 0
 
     full_epoch = base_epochs * epochs_per_image_batch
+
+    optimizer = SGD(learning_rate=learning_rate)
+    #model.optimizer = optimizer
 
     # Обучение модели
     for epoch in range(full_epoch):
         print(f"\nЗапуск эпохи {epoch + 1}/{full_epoch}")
+        print(f"\nСкорость обучения {learning_rate}")
+
+        # Динамическое изменение скорости обучения
+        if consecutive_no_improvement >= 1:
+            # Уменьшаем скорость обучения
+            learning_rate *= 0.5
+            optimizer = SGD(learning_rate=learning_rate)
+            model.optimizer = optimizer
+            print(f"\nСкорость обучения уменьшена до {model.optimizer.learning_rate}")
 
         history = model.fit(
             train_generator,
             steps_per_epoch=steps_per_epoch,
             validation_data=validation_generator,
             epochs=1,  # Одна эпоха за раз
-            class_weight=class_weights_dict  # Добавляем веса классов
+            class_weight=class_weights_dict,  # Добавляем веса классов
         )
 
         # Логика ручного early_stopping
         val_loss = history.history['val_loss'][0]
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            wait = 0
+            consecutive_no_improvement = 0
             # Сохраняем лучшую модель
             model.save(checkpoint_model_filename)
-            print(f"Лучшая модель сохранена в {checkpoint_model_filename}")
-        else:
-            wait += 1
-            if wait >= patience:
+            print(f"\nЛучшая модель сохранена в {checkpoint_model_filename}")
+        else:  
+            consecutive_no_improvement += 1
+            if consecutive_no_improvement > 3 * epochs_per_image_batch:
                 print("\nEarly stopping сработал!")
                 break
 
