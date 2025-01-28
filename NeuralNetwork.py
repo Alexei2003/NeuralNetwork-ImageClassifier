@@ -1,318 +1,308 @@
-﻿# model
-from tensorflow.keras.layers import Input, Conv2D, MaxPooling2D, Dense, Dropout, BatchNormalization, Activation, GlobalAveragePooling2D, Add, Reshape, Multiply
-from tensorflow.keras.preprocessing.image import ImageDataGenerator 
-from tensorflow.keras.regularizers import l1_l2
-from tensorflow.keras.models import load_model, Model
+import tensorflow as tf
+from tensorflow.keras.layers import (Input, Conv2D, MaxPooling2D, Dense, Dropout, 
+                                   BatchNormalization, Activation, GlobalAveragePooling2D,
+                                   Add, Reshape, Multiply, Layer, LayerNormalization,
+                                   RandomRotation, RandomZoom, RandomContrast, RandomBrightness)
+from tensorflow.keras.models import Model, load_model
 from tensorflow.keras.optimizers import SGD
+from tensorflow.keras.regularizers import l1_l2
+from tensorflow.keras.callbacks import ReduceLROnPlateau, ModelCheckpoint, EarlyStopping, Callback
+from tensorflow.keras.mixed_precision import set_global_policy
+from tensorflow.keras import backend as K
+import os
+import numpy as np
 from sklearn.utils.class_weight import compute_class_weight
 
-# params system
-import os
-from tensorflow.keras.mixed_precision import set_global_policy
+# Установка политики смешанной точности для ускорения обучения
 set_global_policy('mixed_float16')
 
-# convert
-import tf2onnx
-import tensorflow as tf
-import onnxruntime as ort
-import numpy as np
+class Config:
+    # Параметры модели
+    input_shape = (224, 224, 3)    # Размер входных изображений
+    l1_value = 1e-4                # Коэффициент L1-регуляризации
+    l2_value = 1e-5                # Коэффициент L2-регуляризации
+    num_experts = 8                # Количество экспертов в слое MoE
+    expert_units = 1024            # Количество нейронов в каждом эксперте
+    dropout_rate = 0.3             # Процент дропаута
+    
+    # Параметры обучения
+    initial_learning_rate = 1e-0   # Начальная скорость обучения
+    batch_size = 64                # Размер батча
+    min_learning_rate = 1e-10      # Минимальная скорость обучения
+    reduce_lr_factor = 0.5         # Фактор уменьшения скорости обучения
+    reduce_lr_patience = 2         # Количество эпох без улучшений для уменьшения LR
+    early_stopping_patience = 5    # Количество эпох для ранней остановки
+    epochs = 1000                  # Количество эпох обучения
+    
+    # Параметры Focal Loss для работы с несбалансированными классами
+    focal_alpha = 0.25             # Весовой коэффициент для классов
+    focal_gamma = 2.0              # Коэффициент фокусировки
+    
+    # Пути для сохранения результатов
+    source_dir = "/media/alex/Programs/NeuralNetwork/DataSet/ARTS/Original"
+    checkpoint_path = "/media/alex/Programs/NeuralNetwork/Model/best_model.keras"
+    labels_path = "/media/alex/Programs/NeuralNetwork/Model/labels.txt"
+    onnx_path = "/media/alex/Programs/NeuralNetwork/Model/model.onnx"
 
-#params my
-l1_value = 1e-4
-l2_value = 1e-4
-initial_learning_rate = 1e-4
+config = Config()
 
-# SE-блок
+class MoE(Layer):
+    """Слой 'Смесь экспертов' (Mixture of Experts)"""
+    def __init__(self, num_experts, expert_units, **kwargs):
+        super(MoE, self).__init__(**kwargs)
+        self.num_experts = num_experts
+        self.expert_units = expert_units
+
+    def build(self, input_shape):
+        self.experts = [
+            tf.keras.Sequential([
+                Dense(self.expert_units, activation='swish',
+                      kernel_regularizer=l1_l2(config.l1_value, config.l2_value)),
+                Dropout(config.dropout_rate),
+                Dense(input_shape[-1],
+                      kernel_regularizer=l1_l2(config.l1_value, config.l2_value))
+            ]) for _ in range(self.num_experts)
+        ]
+        self.router = Dense(self.num_experts, activation='softmax',
+                            kernel_regularizer=l1_l2(config.l1_value, config.l2_value))
+        super(MoE, self).build(input_shape)
+
+    def call(self, inputs):
+        weights = self.router(inputs)  # (batch_size, num_experts)
+        expert_outputs = tf.stack([expert(inputs) for expert in self.experts], axis=1)  # (batch_size, num_experts, units)
+        weighted_outputs = tf.einsum('be,beu->bu', weights, expert_outputs)
+        return weighted_outputs + inputs
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            'num_experts': self.num_experts,
+            'expert_units': self.expert_units
+        })
+        return config
+
+def focal_loss(y_true, y_pred):
+    alpha = config.focal_alpha
+    gamma = config.focal_gamma
+    
+    y_pred = K.clip(y_pred, K.epsilon(), 1. - K.epsilon())
+    cross_entropy = -y_true * K.log(y_pred)
+    loss = alpha * K.pow(1. - y_pred, gamma) * cross_entropy
+    return K.sum(loss, axis=1)
+
 def se_block(input_tensor, reduction=16):
-    """Добавление Squeeze-and-Excitation блока."""
-    channel_axis = -1  # Ось каналов (последняя ось)
-    filters = input_tensor.shape[channel_axis]
-    
-    # Сжатие: глобальный средний пуллинг
-    se_tensor = GlobalAveragePooling2D()(input_tensor)
-    se_tensor = Reshape((1, 1, filters))(se_tensor)
-    
-    # Excitation: полносвязные слои для вычисления важности каналов
-    se_tensor = Dense(filters // reduction, activation='relu', kernel_regularizer=l1_l2(l1=l1_value, l2=l2_value) )(se_tensor)
-    se_tensor = Dense(filters, activation='sigmoid', kernel_regularizer=l1_l2(l1=l1_value, l2=l2_value) )(se_tensor)
+    channels = input_tensor.shape[-1]
+    se = GlobalAveragePooling2D()(input_tensor)
+    se = Reshape((1, 1, channels))(se)
+    se = Dense(channels // reduction, activation='swish',
+               kernel_regularizer=l1_l2(config.l1_value, config.l2_value))(se)
+    se = Dense(channels, activation='sigmoid',
+               kernel_regularizer=l1_l2(config.l1_value, config.l2_value))(se)
+    return Multiply()([input_tensor, se])
 
-    # Масштабирование входного тензора по вычисленным весам
-    return Multiply()([input_tensor, se_tensor])
-
-# Модифицированный Bottleneck-блок с SE-блоком
-def bottleneck_block(input_tensor, filters, stride=1, reduction=16):
-    """Bottleneck-блок с Squeeze-and-Excitation."""
-    shortcut = input_tensor
-
-    # Проекционный shortcut (если требуется изменение размерности)
-    if shortcut.shape[-1] != filters * 4 or stride > 1:
-        shortcut = Conv2D(filters * 4, (1, 1), strides=stride, padding='same', kernel_regularizer=l1_l2(l1=l1_value, l2=l2_value) )(shortcut)
+def residual_block(x, filters, stride=1):
+    shortcut = x
+    if stride != 1 or shortcut.shape[-1] != filters:
+        shortcut = Conv2D(filters, (1, 1), strides=stride,
+                          kernel_regularizer=l1_l2(config.l1_value, config.l2_value))(shortcut)
         shortcut = BatchNormalization()(shortcut)
-
-    # Слой 1: 1x1 свёртка (уменьшение числа каналов)
-    x = Conv2D(filters, (1, 1), strides=stride, padding='same', kernel_regularizer=l1_l2(l1=l1_value, l2=l2_value) )(input_tensor)
+    
+    x = Conv2D(filters, (3, 3), strides=stride, padding='same',
+               kernel_regularizer=l1_l2(config.l1_value, config.l2_value))(x)
     x = BatchNormalization()(x)
-    x = Activation('relu')(x)
-
-    # Слой 2: 3x3 свёртка
-    x = Conv2D(filters, (3, 3), padding='same', kernel_regularizer=l1_l2(l1=l1_value, l2=l2_value) )(x)
+    x = Activation('swish')(x)
+    
+    x = Conv2D(filters, (3, 3), padding='same',
+               kernel_regularizer=l1_l2(config.l1_value, config.l2_value))(x)
     x = BatchNormalization()(x)
-    x = Activation('relu')(x)
-
-    # Слой 3: 1x1 свёртка (восстановление размерности)
-    x = Conv2D(filters * 4, (1, 1), padding='same', kernel_regularizer=l1_l2(l1=l1_value, l2=l2_value) )(x)
-    x = BatchNormalization()(x)
-
-    # Применяем SE-блок
-    x = se_block(x, reduction)
-
-    # Добавление shortcut
+    x = se_block(x)
+    
     x = Add()([x, shortcut])
-    x = Activation('relu')(x)
+    return Activation('swish')(x)
 
-    return x
-
-# Функция для создания серии Bottleneck-блоков с SE
-def build_residual_blocks(input_tensor, num_blocks, filters, stride=1, reduction=16):
-    """Создаёт серию Bottleneck-блоков с SE-блоком."""
-    x = bottleneck_block(input_tensor, filters, stride=stride, reduction=reduction)
-    for _ in range(1, num_blocks):
-        x = bottleneck_block(x, filters, stride=1, reduction=reduction)
-    return x
-
-# Основная модель с SE-блоками
-def build_cnn(input_shape, num_classes):
-    """Создаёт свёрточную нейронную сеть с Bottleneck-блоками и SE-блоками."""
-    # Входной слой
-    input_tensor = Input(shape=input_shape)
-    x = input_tensor
-
-    # Начальная свёртка
-    x = Conv2D(64, (7, 7), strides=2, padding='same', kernel_regularizer=l1_l2(l1=l1_value, l2=l2_value) )(x)
+def build_model(input_shape, num_classes):
+    inputs = Input(shape=input_shape)
+    
+    x = Conv2D(64, (7, 7), strides=2, padding='same',
+               kernel_regularizer=l1_l2(config.l1_value, config.l2_value))(inputs)
     x = BatchNormalization()(x)
-    x = Activation('relu')(x)
-    x = MaxPooling2D(pool_size=(3, 3), strides=2, padding='same')(x)
-
-    # # Residual-блоки с SE (для ResNet-50)
-    # x = build_residual_blocks(x, num_blocks=3, filters=64, stride=1)   # Conv2_x
-    # x = build_residual_blocks(x, num_blocks=4, filters=128, stride=2)  # Conv3_x
-    # x = build_residual_blocks(x, num_blocks=6, filters=256, stride=2)  # Conv4_x
-    # x = build_residual_blocks(x, num_blocks=3, filters=512, stride=2)  # Conv5_x
-
-    # # Residual-блоки с SE (для ResNet-101)
-    # x = build_residual_blocks(x, num_blocks=3, filters=64, stride=1)   # Conv2_x
-    # x = build_residual_blocks(x, num_blocks=4, filters=128, stride=2)  # Conv3_x
-    # x = build_residual_blocks(x, num_blocks=23, filters=256, stride=2) # Conv4_x
-    # x = build_residual_blocks(x, num_blocks=3, filters=512, stride=2)  # Conv5_x
-
-    # Residual-блоки с SE (для ResNet-152)
-    x = build_residual_blocks(x, num_blocks=3, filters=64, stride=1)   # Conv2_x
-    x = build_residual_blocks(x, num_blocks=8, filters=128, stride=2)  # Conv3_x
-    x = build_residual_blocks(x, num_blocks=36, filters=256, stride=2) # Conv4_x
-    x = build_residual_blocks(x, num_blocks=3, filters=512, stride=2)  # Conv5_x
-
-    # Глобальный усреднённый пуллинг
+    x = Activation('swish')(x)
+    x = MaxPooling2D((3, 3), strides=2, padding='same')(x)
+    
+    x = residual_block(x, 64)
+    x = residual_block(x, 128, stride=2)
+    x = residual_block(x, 256, stride=2)
+    x = residual_block(x, 512, stride=2)
+    
     x = GlobalAveragePooling2D()(x)
-
-    # Полносвязная голова
-    x = Dense(1024, kernel_regularizer=l1_l2(l1=l1_value, l2=l2_value) )(x)
-    x = BatchNormalization()(x)
-    x = Activation('relu')(x)
-    x = Dropout(0.5)(x)
-
-    # Выходной слой
-    output_tensor = Dense(num_classes, activation='softmax')(x)
-
-    # Создание модели
-    model = Model(inputs=input_tensor, outputs=output_tensor)
-
-    # Компиляция модели
-    optimizer = SGD(learning_rate=initial_learning_rate)
-    model.compile(optimizer=optimizer, loss='categorical_crossentropy', metrics=['accuracy'])
-
-    model.summary()
+    x = LayerNormalization()(x)
+    
+    x = Dense(1024, activation='swish',
+              kernel_regularizer=l1_l2(config.l1_value, config.l2_value))(x)
+    x = Dropout(config.dropout_rate)(x)
+    x = MoE(config.num_experts, config.expert_units)(x)
+    
+    outputs = Dense(num_classes, activation='softmax', dtype='float32')(x)
+    
+    model = Model(inputs, outputs, name='CustomCNN')
+    model._name = 'CustomCNN' 
+    optimizer = SGD(learning_rate=config.initial_learning_rate, momentum=0.9, nesterov=True)
+    model.compile(optimizer=optimizer,
+                  loss=focal_loss,
+                  metrics=['accuracy'])
     return model
 
-source_dir = "/media/alex/Programs/NeuralNetwork/DataSet/ARTS/Original"
-checkpoint_model_filename = "/media/alex/Programs/NeuralNetwork/Model/checkpoint_model.keras" 
-def run_learning():
-    """Обучение нейроной сети"""
-    # Параметры
-    img_size = (224, 224)  # Размер изображения (224x224)
-    batch_size = 5
-    images_per_epochs_count = 30000  # Текущее количество изображений для обучения
-    steps_per_epoch = images_per_epochs_count // batch_size
-    steps_per_epoch += 1
-    base_epochs = 100
-
-    # Генерация данных
-    datagen = ImageDataGenerator(
-        rescale=1.0 / 255,  # Масштабирование пикселей в диапазон [0, 1]
-        validation_split=0.2,  # Разделение данных на обучение и валидацию
-        rotation_range=30,  # Повороты до 30 градусов
-        width_shift_range=0.3,  # Горизонтальное смещение до 30% от ширины
-        height_shift_range=0.3,  # Вертикальное смещение до 30% от высоты
-        shear_range=0.15,  # Сдвиг (shear) до 15%
-        zoom_range=[0.8, 1.2],  # Увеличение или уменьшение масштаба от 80% до 120%
-        brightness_range=[0.8, 1.2],  # Изменение яркости от 80% до 120%
-        horizontal_flip=True,  # Случайное отражение по горизонтали
-        fill_mode='nearest'  # Заполнение новых пикселей при смещении (nearest, constant, reflect, wrap)
-    )   
-
-    validation_generator = datagen.flow_from_directory(
-        source_dir,
-        target_size=img_size,
-        batch_size=batch_size,
-        class_mode='categorical',
-        subset='validation'
+def create_dataset(subset):
+    return tf.keras.utils.image_dataset_from_directory(
+        config.source_dir,
+        labels='inferred',
+        label_mode='categorical',
+        color_mode='rgb',
+        batch_size=config.batch_size,
+        image_size=(config.input_shape[:2]),
+        validation_split=0.2,
+        subset=subset,
+        seed=123,
+        shuffle=(subset == 'training')
     )
 
-    input_shape = (img_size[0], img_size[1], 3)
+class EpochSpacingCallback(Callback):
+    def on_epoch_end(self, epoch, logs=None):
+        print('\n-------------------------------------------------------------------------------------------------------------------\n')  # Добавляет две пустые строки после каждой эпохи
+
+def run_training():
+    # Создание и проверка директорий
+    os.makedirs(os.path.dirname(config.checkpoint_path), exist_ok=True)
+    
+    # Загрузка данных
+    train_ds = create_dataset('training')
+    val_ds = create_dataset('validation')
+    num_classes = len(train_ds.class_names)
+
+    # Аугментации
+    augmentations = tf.keras.Sequential([
+        RandomRotation(0.2),
+        RandomZoom(0.3),
+        RandomContrast(0.2),
+        RandomBrightness(0.3),
+        tf.keras.layers.RandomFlip(mode='horizontal_and_vertical'),
+    ])
+
+    train_ds = train_ds.map(
+        lambda x, y: (augmentations(x, training=True), y),
+        num_parallel_calls=tf.data.AUTOTUNE
+    ).prefetch(tf.data.AUTOTUNE)
+
+    # Расчет весов классов
+    labels = np.concatenate([y.numpy().argmax(axis=1) for x, y in train_ds], axis=0)
+    class_weights = compute_class_weight("balanced", classes=np.unique(labels), y=labels)
+    class_weights_dict = {i: w for i, w in enumerate(class_weights)}
 
     # Проверяем, существует ли модель и её архитектура
-    if os.path.exists(checkpoint_model_filename):
+    if os.path.exists(config.checkpoint_path):
         print("\nЗагрузка предобученной модели...\n")
-        model = load_model(checkpoint_model_filename)
-        learning_rate = model.optimizer.learning_rate
+        model = load_model(
+            config.checkpoint_path,
+            custom_objects={
+                'MoE': MoE,
+                'focal_loss': focal_loss,
+                'LayerNormalization': LayerNormalization
+            }
+        )
+
     else:
         print("\nСоздание новой модели...\n")
-        model = build_cnn(input_shape, len(validation_generator.class_indices))
-        learning_rate = initial_learning_rate
+        # Построение модели
+        model = build_model(config.input_shape, num_classes)
+        model.summary()
 
-    # Пересоздаём train_generator на каждую эпоху
-    train_generator = datagen.flow_from_directory(
-        source_dir,
-        target_size=img_size,
-        batch_size=batch_size,
-        class_mode='categorical',
-        subset='training',
-        shuffle=True  # Перемешиваем данные
+    # Колбэки
+    callbacks = [
+        ReduceLROnPlateau(
+            monitor='val_loss',
+            factor=config.reduce_lr_factor,
+            patience=config.reduce_lr_patience,
+            min_lr=config.min_learning_rate,
+            verbose=1
+        ),
+        ModelCheckpoint(
+            config.checkpoint_path,
+            save_best_only=True,
+            monitor='val_loss',
+            verbose=1
+        ),
+        EarlyStopping(
+            monitor='val_loss',
+            patience=config.early_stopping_patience,
+            restore_best_weights=True
+        ),
+        EpochSpacingCallback()
+    ]
+
+    # Обучение
+    history = model.fit(
+        train_ds,
+        validation_data=val_ds,
+        epochs=config.epochs,
+        callbacks=callbacks,
+        class_weight=class_weights_dict
     )
 
-    train_images_count = train_generator.samples  # Количество изображений для обучения
+    return model
 
-    # Вычисляем веса классов
-    class_weights = compute_class_weight(
-        class_weight='balanced',
-        classes=np.unique(train_generator.classes),
-        y=train_generator.classes
-    )
-    class_weights_dict = dict(enumerate(class_weights))
-
-    epochs_per_image_batch = train_images_count // images_per_epochs_count
-    epochs_per_image_batch += 1
-
-    # Состояние для ручного early_stopping
-    best_val_loss = float('inf')
-    consecutive_no_improvement = 0
-
-    full_epoch = base_epochs * epochs_per_image_batch
-
-    optimizer = SGD(learning_rate=learning_rate)
-    #model.optimizer = optimizer
-
-    # Обучение модели
-    for epoch in range(full_epoch):
-        print(f"\nЗапуск эпохи {epoch + 1}/{full_epoch}")
-        print(f"\nСкорость обучения {learning_rate}")
-
-        # Динамическое изменение скорости обучения
-        if consecutive_no_improvement >= 1:
-            # Уменьшаем скорость обучения
-            learning_rate *= 0.5
-            optimizer = SGD(learning_rate=learning_rate)
-            model.optimizer = optimizer
-            print(f"\nСкорость обучения уменьшена до {model.optimizer.learning_rate}")
-
-        history = model.fit(
-            train_generator,
-            steps_per_epoch=steps_per_epoch,
-            validation_data=validation_generator,
-            epochs=1,  # Одна эпоха за раз
-            class_weight=class_weights_dict,  # Добавляем веса классов
-        )
-
-        # Логика ручного early_stopping
-        val_loss = history.history['val_loss'][0]
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            consecutive_no_improvement = 0
-            # Сохраняем лучшую модель
-            model.save(checkpoint_model_filename)
-            print(f"\nЛучшая модель сохранена в {checkpoint_model_filename}")
-        else:  
-            consecutive_no_improvement += 1
-            if consecutive_no_improvement > 3 * epochs_per_image_batch:
-                print("\nEarly stopping сработал!")
-                break
-
-        # Пересоздаём train_generator на каждую эпоху
-        train_generator = datagen.flow_from_directory(
-            source_dir,
-            target_size=img_size,
-            batch_size=batch_size,
-            class_mode='categorical',
-            subset='training',
-            shuffle=True  # Перемешиваем данные
-        )
-
-    # Тестирование модели
-    test_loss, test_accuracy = model.evaluate(validation_generator)
-    print(f"\nРезультаты тестирования:\n - Потери (Loss): {test_loss:.4f}\n - Точность (Accuracy): {test_accuracy:.4f}")
-
-labels_path = "/media/alex/Programs/NeuralNetwork/Model/labels.txt" 
 def save_labels():
     """Сохраняет текстовые метки из директорий классов."""
-    class_names = sorted(os.listdir(source_dir))
-    with open(labels_path, "w") as f:
+    class_names = sorted(os.listdir(config.source_dir))
+    with open(config.labels_path, "w") as f:
         for label in class_names:
             f.write(label + "\n")
-    print(f"Метки сохранены в {labels_path}")
+    print(f"Метки сохранены в {config.labels_path}")
     return class_names
 
-onnx_model_filename = "/media/alex/Programs/NeuralNetwork/Model/model.onnx" 
-def load_and_convert_model():
-    """Конввертирует в ONNX"""
-
-    # Загрузка модели из контрольной точки
-    model = load_model(checkpoint_model_filename)
-
-    # Конвертация и сохранение модели в формате ONNX
-    input_signature = [tf.TensorSpec([None, 224, 224, 3], tf.float32)]
-    tf2onnx.convert.from_keras(model, input_signature=input_signature, output_path=onnx_model_filename)
-    test_onnx_model_with_random_tensor()
-
-def test_onnx_model_with_random_tensor():
-    # Загрузка ONNX модели
-    session = ort.InferenceSession(onnx_model_filename)
+def convert_to_onnx():
+    import tf2onnx
+    import onnxruntime as ort
     
-    # Получить имена входов и выходов
+    model = tf.keras.models.load_model(
+        config.checkpoint_path,
+        custom_objects={'MoE': MoE, 'focal_loss': focal_loss}
+    )
+    
+    input_signature = [tf.TensorSpec(shape=[None, *config.input_shape], dtype=tf.float32)]
+    tf2onnx.convert.from_keras(model, input_signature=input_signature, output_path=config.onnx_path)
+    
+    # Тестирование ONNX модели
+    session = ort.InferenceSession(config.onnx_path)
     input_name = session.get_inputs()[0].name
-    output_name = session.get_outputs()[0].name
-    
-    # Создать случайный тензор
-    random_tensor = np.random.rand(1, 224, 224, 3).astype(np.float32)  # Batch size = 1
-    
-    # Прогнать модель с случайным тензором
-    outputs = session.run([output_name], {input_name: random_tensor})
-    
-    # Печать результата
-    print("Результат работы модели со случайным тензором:")
-    print(outputs[0])
-      
+    dummy_input = np.random.randn(1, *config.input_shape).astype(np.float32)
+    outputs = session.run(None, {input_name: dummy_input})
+    print("\nТест ONNX модели успешно выполнен!")
+
+    save_labels()
+
 def main():
     while True:
-        print("\nВыберите действие:")
+        print("\nМеню:")
         print("1. Обучить модель")
-        print("2. Конвертировать модель в ONNX")
-
-        choice = input("Введите номер действия (1/2): ")
+        print("2. Конвертировать в ONNX")
+        print("3. Выход")
+        choice = input("Выберите действие (1-3): ").strip()
 
         if choice == '1':
-            run_learning()
+            if not os.path.exists(config.source_dir):
+                print(f"Ошибка: Директория с данными {config.source_dir} не существует!")
+                continue
+            run_training()
+            print("Обучение завершено!")
+        elif choice == '2':
+            if not os.path.exists(config.checkpoint_path):
+                print("Ошибка: Файл модели не найден! Сначала обучите модель.")
+                continue
+            convert_to_onnx()
+        elif choice == '3':
+            break
+        else:
+            print("Неверный ввод! Попробуйте снова.")
 
-        if choice == '2':
-            load_and_convert_model()
-            save_labels()
-
-main()
+if __name__ == "__main__":
+    main()
