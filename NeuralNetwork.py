@@ -26,8 +26,8 @@ class Config:
     l1_value = 1e-5                # Коэффициент L1-регуляризации
     l2_value = 1e-4                # Коэффициент L2-регуляризации
     dropout_rate = 0.5             # Процент дропаута
-    num_experts = 16               # Количество экспертов в слое MoE
-    expert_units = 512             # Нейронов в каждом эксперте
+    num_experts = 32               # Количество экспертов в слое MoE
+    expert_units = 128             # Нейронов в каждом эксперте
     se_reduction = 16              # Коэффициент уменьшения в SE-блоке
 
     # --------------------- Параметры обучения ---------------------
@@ -63,10 +63,10 @@ set_global_policy('mixed_float16')  # Включение mixed precision
 
 # ====================== КАСТОМНЫЕ КОМПОНЕНТЫ ======================
 class MoE(Layer):
-    def __init__(self, num_experts, expert_units, **kwargs):
+    def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.num_experts = num_experts
-        self.expert_units = expert_units
+        self.num_experts = config.num_experts
+        self.expert_units = config.expert_units
 
     def build(self, input_shape):
         self.experts = [self._build_expert(input_shape[-1]) for _ in range(self.num_experts)]
