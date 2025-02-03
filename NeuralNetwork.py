@@ -27,7 +27,7 @@ class Config:
     l2_value = 1e-4                # Коэффициент L2-регуляризации
     dropout_rate = 0.5             # Процент дропаута
     num_experts = 32               # Количество экспертов в слое MoE
-    expert_units = 128             # Нейронов в каждом эксперте
+    expert_units = 256             # Нейронов в каждом эксперте
     se_reduction = 16              # Коэффициент уменьшения в SE-блоке
 
     # --------------------- Параметры обучения ---------------------
@@ -234,8 +234,14 @@ def run_training():
     # Инициализация модели
     if os.path.exists(config.checkpoint_path):
         print("Загрузка модели...")
-        model = load_model(config.checkpoint_path,
-                          custom_objects={'MoE': MoE, 'focal_loss': focal_loss})
+        model = load_model(
+            config.checkpoint_path,
+            custom_objects={
+                'MoE': MoE,
+                'focal_loss': focal_loss,
+                'LayerNormalization': LayerNormalization
+            }
+        )
         if model.output_shape[-1] != num_classes:
             raise ValueError(f"Модель обучена на {model.output_shape[-1]} классов, данные содержат {num_classes}")
     else:
