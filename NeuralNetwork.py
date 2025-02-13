@@ -18,6 +18,8 @@ from tensorflow.keras import backend as K
 import os
 import numpy as np
 from sklearn.utils.class_weight import compute_class_weight
+import tf2onnx
+import onnxruntime as ort
 
 # ========================== КОНФИГУРАЦИЯ ==========================
 class Config:
@@ -59,14 +61,13 @@ class Config:
 
 # Инициализация конфигурации
 config = Config()
-set_global_policy('mixed_float16')  # Включение mixed precision
 
 # ====================== КАСТОМНЫЕ КОМПОНЕНТЫ ======================
 class MoE(Layer):
-    def __init__(self, **kwargs):
+    def __init__(self, num_experts=8, expert_units=1024, **kwargs):  # Добавляем параметры в конструктор
         super().__init__(**kwargs)
-        self.num_experts = config.num_experts
-        self.expert_units = config.expert_units
+        self.num_experts = num_experts
+        self.expert_units = expert_units
 
     def build(self, input_shape):
         self.experts = [self._build_expert(input_shape[-1]) for _ in range(self.num_experts)]
@@ -165,7 +166,7 @@ def build_model(num_classes):
     x = Dense(1024, activation='swish',
               kernel_regularizer=l1_l2(config.l1_value, config.l2_value))(x)
     x = Dropout(config.dropout_rate)(x)
-    x = MoE()(x)
+    x = MoE(config.num_experts, config.expert_units)(x)
     
     outputs = Dense(num_classes, activation='softmax', dtype='float32')(x)
     
@@ -278,10 +279,8 @@ def save_labels():
     print(f"Метки сохранены в {config.labels_path}")
 
 def convert_to_onnx():
-    """Конвертация в ONNX формат"""
-    import tf2onnx
-    import onnxruntime as ort
-    
+    """Конвертация модели в ONNX с тестированием на реальных изображениях"""
+    # Загрузка модели
     model = load_model(
         config.checkpoint_path,
         custom_objects={
@@ -290,16 +289,61 @@ def convert_to_onnx():
             'LayerNormalization': LayerNormalization
         }
     )
+
+    # Конвертация в ONNX
     input_signature = [tf.TensorSpec(shape=[None, *config.input_shape], dtype=tf.float32)]
     tf2onnx.convert.from_keras(model, input_signature=input_signature, output_path=config.onnx_path)
-    
-    # Проверка
+    save_labels()
+
+    print("модель сохранена")
+
+    check_onnx_work()
+
+def check_onnx_work():
+    # Получение меток классов
+    train_ds = tf.keras.utils.image_dataset_from_directory(
+        config.source_dir,
+        image_size=config.input_shape[:2],
+        batch_size=config.batch_size,
+        shuffle=False
+    )
+    class_names = train_ds.class_names
+    with open(config.labels_path, 'w') as f:
+        f.write('\n'.join(class_names))
+
+    # Загрузка ONNX модели
     session = ort.InferenceSession(config.onnx_path)
     input_name = session.get_inputs()[0].name
-    dummy_input = np.random.randn(1, *config.input_shape).astype(np.float32)
-    session.run(None, {input_name: dummy_input})
-    print("ONNX конвертация успешна!")
-    save_labels()
+
+    # Обработка изображения в папке
+    img_path = "test.jpg"
+    
+    # Загрузка и предобработка изображения
+    img = tf.keras.preprocessing.image.load_img(
+        img_path, 
+        target_size=config.input_shape[:2]
+    )
+    img_array = tf.keras.preprocessing.image.img_to_array(img)
+    img_array = tf.expand_dims(img_array, 0) / 255.0  # Нормализация [0,1]
+    
+    # Вывод информации о изображении
+    print(f"\n🔍 Анализ изображения: {img_path}")
+    print(f"Размер изображения: {img.size}")
+    print(f"Форма входных данных: {img_array.shape}")
+
+    # Выполнение предсказания
+    results = session.run(None, {input_name: img_array.numpy().astype(np.float32)})
+    probabilities = results[0][0]
+    
+    # Получение топ-5 предсказаний
+    top5_indices = np.argsort(probabilities)[::-1][:5]
+    top5_classes = [class_names[i] for i in top5_indices]
+    top5_probs = [probabilities[i] for i in top5_indices]
+
+    # Вывод результатов
+    print("\n🔮 Результаты классификации:")
+    for cls, prob in zip(top5_classes, top5_probs):
+        print(f"  {cls}: {prob*100:.2f}%")
 
 # ====================== ИНТЕРФЕЙС ПОЛЬЗОВАТЕЛЯ ======================
 def main():
@@ -308,7 +352,8 @@ def main():
         print("\nМеню:")
         print("1. Обучить модель")
         print("2. Конвертировать в ONNX")
-        print("3. Выход")
+        print("3. Тест ONNX")
+        print("exit. Выход")
         choice = input("Выберите действие: ").strip()
         
         if choice == '1':
@@ -323,6 +368,8 @@ def main():
                 continue
             convert_to_onnx()
         elif choice == '3':
+            check_onnx_work()
+        elif choice == 'exit':
             print("Выход...")
             break
         else:
