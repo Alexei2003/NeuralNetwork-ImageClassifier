@@ -20,6 +20,8 @@ import numpy as np
 from sklearn.utils.class_weight import compute_class_weight
 import tf2onnx
 import onnxruntime as ort
+import matplotlib.pyplot as plt
+import math
 
 # ========================== КОНФИГУРАЦИЯ ==========================
 class Config:
@@ -38,7 +40,7 @@ class Config:
     epochs = 1000                  # Максимальное число эпох
     min_learning_rate = 1e-10      # Минимальная скорость обучения
     reduce_lr_factor = 0.25        # Фактор уменьшения LR
-    reduce_lr_patience = 2         # Терпение для уменьшения LR
+    reduce_lr_patience = 1         # Терпение для уменьшения LR
     early_stopping_patience = 10   # Терпение для ранней остановки
     focal_alpha = 0.25             # Параметр Focal Loss (баланс классов)
     focal_gamma = 2.0              # Параметр Focal Loss (фокусировка)
@@ -194,23 +196,45 @@ def create_dataset(subset):
         seed=config.augment_seed,
         shuffle=(subset == 'training')
     )
+   
 
 class EpochSpacingCallback(Callback):
     """Визуальное разделение логов обучения"""
     def on_epoch_end(self, epoch, logs=None):
         print('\n' + '=' * 100 + '\n')
 
+def plot_images(ds, num_images=30, filename='samples.png', cols=5):
+    rows = math.ceil(num_images / cols)  # Вычисляем количество строк
+    plt.figure(figsize=(cols * 5, rows * 5))  # Автоматическое масштабирование
+
+    for i, (image, label) in enumerate(ds.take(num_images)):
+        image = image[0]  # Берем первое изображение из батча
+        plt.subplot(rows, cols, i + 1)  # Размещаем по строкам и колонкам
+        plt.imshow((image * 255.0).numpy().astype('uint8'))  # Денормализация для uint8
+        plt.title(train_ds_raw.class_names[label.numpy().argmax()], fontsize=18)
+        plt.axis('off')
+
+    plt.tight_layout()  # Убираем наложение
+    plt.savefig(filename)
+    plt.close()
+
 # ====================== ОБУЧЕНИЕ МОДЕЛИ ======================
 def run_training():
     """Запуск процесса обучения с аугментацией"""
     os.makedirs(os.path.dirname(config.checkpoint_path), exist_ok=True)
-    
-    # Загрузка данных
-    train_ds = create_dataset('training')
-    val_ds = create_dataset('validation')
-    num_classes = len(train_ds.class_names)
 
-    # Аугментация
+    # Загрузка данных
+    train_ds_raw = create_dataset('training')
+    val_ds_raw = create_dataset('validation')
+    num_classes = len(train_ds_raw.class_names)
+
+    # Статическая предобработка (общая для train/val)
+    def static_preprocessing(image, label):
+        #Нормализация
+        image = tf.cast(image, tf.float32) / 255.0
+        return image, label
+
+    # Аугментации (только для тренировочных данных)
     augmentations = tf.keras.Sequential([
         RandomRotation(config.rotation_range),
         RandomZoom(config.zoom_range),
@@ -222,13 +246,28 @@ def run_training():
             'vertical' if config.vertical_flip else None
         )
     ])
-    train_ds = train_ds.map(
-        lambda x, y: (augmentations(x, training=True), y),
-        num_parallel_calls=tf.data.AUTOTUNE
-    ).prefetch(tf.data.AUTOTUNE)
 
-    # Веса классов
-    labels = np.concatenate([y.numpy().argmax(axis=1) for x, y in train_ds], axis=0)
+    # Пайплайн для тренировочных данных
+    train_ds = (
+        train_ds_raw
+        .map(lambda x, y: (augmentations(x, training=True), y), num_parallel_calls=tf.data.AUTOTUNE)
+        .map(static_preprocessing, num_parallel_calls=tf.data.AUTOTUNE)
+        .prefetch(tf.data.AUTOTUNE)
+    )
+
+    # Пайплайн для валидационных данных
+    val_ds = (
+        val_ds_raw
+        .map(static_preprocessing, num_parallel_calls=tf.data.AUTOTUNE)
+        .prefetch(tf.data.AUTOTUNE)
+    )
+
+    # вывод изображений
+    plot_images(train_ds, filename='train_samples.png', cols=5)
+    plot_images(val_ds, filename='val_samples.png', cols=5)
+
+    # Веса классов (считаем на исходных данных)
+    labels = np.concatenate([y.numpy().argmax(axis=1) for x, y in train_ds_raw], axis=0)
     class_weights = compute_class_weight("balanced", classes=np.unique(labels), y=labels)
     class_weights_dict = {i: w for i, w in enumerate(class_weights)}
 
@@ -317,18 +356,16 @@ def check_onnx_work():
 
     # Обработка изображения в папке
     img_path = "test.jpg"
-    
-    # Загрузка и предобработка изображения
-    img = tf.keras.preprocessing.image.load_img(
-        img_path, 
-        target_size=config.input_shape[:2]
-    )
+
+    # Загрузка изображения без изменения размера
+    img = tf.keras.preprocessing.image.load_img(img_path)
     img_array = tf.keras.preprocessing.image.img_to_array(img)
-    img_array = tf.expand_dims(img_array, 0) / 255.0  # Нормализация [0,1]
+
+    # Добавляем размерность батча и нормализуем
+    img_array = tf.expand_dims(img_array, 0) / 255.0 # Нормализация [0,1]
     
     # Вывод информации о изображении
     print(f"\n🔍 Анализ изображения: {img_path}")
-    print(f"Размер изображения: {img.size}")
     print(f"Форма входных данных: {img_array.shape}")
 
     # Выполнение предсказания
@@ -341,7 +378,29 @@ def check_onnx_work():
     top5_probs = [probabilities[i] for i in top5_indices]
 
     # Вывод результатов
-    print("\n🔮 Результаты классификации:")
+    print("\n🔮 Результаты классификации onnx:")
+    for cls, prob in zip(top5_classes, top5_probs):
+        print(f"  {cls}: {prob*100:.2f}%")
+
+    model = load_model(
+        config.checkpoint_path,
+        custom_objects={
+            'MoE': MoE,
+            'focal_loss': focal_loss,
+            'LayerNormalization': LayerNormalization
+        }
+    )
+
+    results = model.predict(img_array)
+
+    probabilities = results[0]
+    
+    # Получение топ-5 предсказаний
+    top5_indices = np.argsort(probabilities)[::-1][:5]
+    top5_classes = [class_names[i] for i in top5_indices]
+    top5_probs = [probabilities[i] for i in top5_indices]
+
+    print("\n🔮 Результаты классификации keras:")
     for cls, prob in zip(top5_classes, top5_probs):
         print(f"  {cls}: {prob*100:.2f}%")
 
