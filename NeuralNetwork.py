@@ -203,7 +203,7 @@ class EpochSpacingCallback(Callback):
     def on_epoch_end(self, epoch, logs=None):
         print('\n' + '=' * 100 + '\n')
 
-def plot_images(ds, num_images=30, filename='samples.png', cols=5):
+def plot_images(ds, train_ds_raw, num_images=30, filename='samples.png', cols=5):
     rows = math.ceil(num_images / cols)  # Вычисляем количество строк
     plt.figure(figsize=(cols * 5, rows * 5))  # Автоматическое масштабирование
 
@@ -263,8 +263,8 @@ def run_training():
     )
 
     # вывод изображений
-    plot_images(train_ds, filename='train_samples.png', cols=5)
-    plot_images(val_ds, filename='val_samples.png', cols=5)
+    plot_images(train_ds, train_ds_raw, filename='train_samples.png', cols=5)
+    plot_images(val_ds, train_ds_raw, filename='val_samples.png', cols=5)
 
     # Веса классов (считаем на исходных данных)
     labels = np.concatenate([y.numpy().argmax(axis=1) for x, y in train_ds_raw], axis=0)
