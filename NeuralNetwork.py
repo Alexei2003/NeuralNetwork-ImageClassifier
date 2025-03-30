@@ -227,6 +227,7 @@ def run_training():
     train_ds_raw = create_dataset('training')
     val_ds_raw = create_dataset('validation')
     num_classes = len(train_ds_raw.class_names)
+    save_labels(train_ds_raw.class_names)
 
     # Статическая предобработка (общая для train/val)
     def static_preprocessing(image, label):
@@ -310,9 +311,8 @@ def run_training():
     return model
 
 # ====================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ======================
-def save_labels():
+def save_labels(class_names):
     """Сохранение меток классов"""
-    class_names = sorted(os.listdir(config.source_dir))
     with open(config.labels_path, "w") as f:
         for label in class_names: f.write(label + "\n")
     print(f"Метки сохранены в {config.labels_path}")
@@ -332,7 +332,6 @@ def convert_to_onnx():
     # Конвертация в ONNX
     input_signature = [tf.TensorSpec(shape=[None, *config.input_shape], dtype=tf.float32)]
     tf2onnx.convert.from_keras(model, input_signature=input_signature, output_path=config.onnx_path)
-    save_labels()
 
     print("модель сохранена")
 
