@@ -27,32 +27,30 @@ import math
 class Config:
     # -------------------- Архитектура модели --------------------
     input_shape = (224, 224, 3)    # Размер входных изображений (H, W, C)
-    l1_value = 1e-6                # Коэффициент L1-регуляризации
-    l2_value = 1e-5                # Коэффициент L2-регуляризации
+    l1_value = 1e-5                # Коэффициент L1-регуляризации
+    l2_value = 1e-4                # Коэффициент L2-регуляризации
     dropout_rate = 0.5             # Процент дропаута
     num_experts = 8                # Количество экспертов в слое MoE
     expert_units = 1024            # Нейронов в каждом эксперте
     se_reduction = 16              # Коэффициент уменьшения в SE-блоке
 
     # --------------------- Параметры обучения ---------------------
-    initial_learning_rate = 1e-2   # Начальная скорость обучения
+    initial_learning_rate = 1e-0   # Начальная скорость обучения
     batch_size = 32                # Размер батча
     epochs = 1500                  # Максимальное число эпох
     min_learning_rate = 1e-10      # Минимальная скорость обучения
-    reduce_lr_factor = 0.1         # Фактор уменьшения LR
+    reduce_lr_factor = 0.5         # Фактор уменьшения LR
     reduce_lr_patience = 2         # Терпение для уменьшения LR
     early_stopping_patience = 10   # Терпение для ранней остановки
     focal_gamma = 4                # Параметр Focal Loss (фокусировка)
-    class_weight_gamma = 2         # Усиление влияние весов класса
+    class_weight_gamma = 3         # Усиление влияние весов класса
 
     # --------------------- Аугментация данных ---------------------
-    rotation_range = 0.4           # Максимальный угол поворота (доля от 180°)
-    zoom_range = 0.4               # Максимальное увеличение/уменьшение
-    contrast_range = 0.4           # Диапазон изменения контраста
-    saturation_range = 0.4         # Диапазон изменения насыщености
-    brightness_range = 0.4         # Диапазон изменения яркости
-    horizontal_flip = True         # Горизонтальное отражение
-    vertical_flip = False          # Вертикальное отражение
+    rotation_range = 0.3           # Максимальный угол поворота (доля от 180°)
+    zoom_range = 0.3               # Максимальное увеличение/уменьшение
+    contrast_range = 0.3           # Диапазон изменения контраста
+    saturation_range = 0.3         # Диапазон изменения насыщености
+    brightness_range = 0.3         # Диапазон изменения яркости
     validation_split = 0.2         # Доля данных для валидации
     augment_seed = 123             # Сид для воспроизводимости аугментаций
 
@@ -294,6 +292,7 @@ def run_training():
     class_counts = np.bincount(labels)
     class_weights = (total_samples / (len(np.unique(labels)) * class_counts)) ** config.class_weight_gamma
     class_weights = class_weights.astype(np.float32)
+    class_weights /= class_weights.max()
     class_weights_dict = {i: w for i, w in enumerate(class_weights)}
 
     # Инициализация модели
