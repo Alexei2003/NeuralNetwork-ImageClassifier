@@ -1,430 +1,387 @@
-"""
-Нейросетевая модель классификации изображений с MoE (Mixture of Experts)
-и автоматическим определением количества классов (оптимизированная версия)
-"""
-
-# ====================== ИМПОРТ БИБЛИОТЕК ======================
-import tensorflow as tf
-from tensorflow.keras.layers import (Input, Conv2D, MaxPooling2D, Dense, Dropout, 
-                                   BatchNormalization, Activation, GlobalAveragePooling2D,
-                                   Add, Reshape, Multiply, Layer, LayerNormalization,
-                                   RandomRotation, RandomZoom, RandomContrast, RandomBrightness,
-                                   RandomFlip, RandomCrop, RandomSaturation)
-from tensorflow.keras.models import Model, load_model
-from tensorflow.keras.optimizers import SGD
-from tensorflow.keras.regularizers import l1_l2
-from tensorflow.keras.callbacks import ReduceLROnPlateau, ModelCheckpoint, EarlyStopping, Callback
-from tensorflow.keras.mixed_precision import set_global_policy
-from tensorflow.keras import backend as K
-import os
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, Dataset
+from torchvision import transforms
 import numpy as np
-from sklearn.utils.class_weight import compute_class_weight
-import tf2onnx
+import os
+from glob import glob
+from PIL import Image
 import onnxruntime as ort
-import math
+from sklearn.metrics import precision_score, recall_score, f1_score
+import time
+from torchsummary import summary
 
-# ========================== КОНФИГУРАЦИЯ ==========================
+# ====================== КОНФИГУРАЦИЯ ======================
 class Config:
-    # -------------------- Архитектура модели --------------------
-    input_shape = (224, 224, 3)    # Размер входных изображений (H, W, C)
-    l1_value = 1e-5                # Коэффициент L1-регуляризации
-    l2_value = 1e-4                # Коэффициент L2-регуляризации
-    dropout_rate = 0.5             # Процент дропаута
-    num_experts = 8                # Количество экспертов в слое MoE
-    expert_units = 1024            # Нейронов в каждом эксперте
-    se_reduction = 16              # Коэффициент уменьшения в SE-блоке
-
-    # --------------------- Параметры обучения ---------------------
-    initial_learning_rate = 1e-0   # Начальная скорость обучения
-    batch_size = 32                # Размер батча
-    epochs = 1500                  # Максимальное число эпох
-    min_learning_rate = 1e-10      # Минимальная скорость обучения
-    reduce_lr_factor = 0.5         # Фактор уменьшения LR
-    reduce_lr_patience = 2         # Терпение для уменьшения LR
-    early_stopping_patience = 10   # Терпение для ранней остановки
-    focal_gamma = 4                # Параметр Focal Loss (фокусировка)
-    class_weight_gamma = 3         # Усиление влияние весов класса
-
-    # --------------------- Аугментация данных ---------------------
-    rotation_range = 0.3           # Максимальный угол поворота (доля от 180°)
-    zoom_range = 0.3               # Максимальное увеличение/уменьшение
-    contrast_range = 0.3           # Диапазон изменения контраста
-    saturation_range = 0.3         # Диапазон изменения насыщености
-    brightness_range = 0.3         # Диапазон изменения яркости
-    validation_split = 0.2         # Доля данных для валидации
-    augment_seed = 123             # Сид для воспроизводимости аугментаций
-
-    # --------------------- Пути сохранения ---------------------
     source_dir = "/media/alex/Programs/NeuralNetwork/DataSet/ARTS/Original"
-    checkpoint_path = "/media/alex/Programs/NeuralNetwork/Model/best_model.keras"
+    checkpoint_path = "/media/alex/Programs/NeuralNetwork/Model/best_model.pth"
     labels_path = "/media/alex/Programs/NeuralNetwork/Model/labels.txt"
     onnx_path = "/media/alex/Programs/NeuralNetwork/Model/model.onnx"
+    input_size = (224, 224)
+    num_experts = 8
+    expert_units = 1024
+    k_top_expert = 2
+    se_reduction = 16
+    lr = 1e-3
+    factor_lr = 0.5
+    patience_lr =2
+    batch_size = 64
+    epochs = 100
+    momentum = 0.95
+    focal_gamma = 5
+    dropout = 0.5
+    mixed_precision = True
+    early_stopping_patience = 10
+    val_split = 0.2
 
-# Инициализация конфигурации
 config = Config()
-gpus = tf.config.experimental.list_physical_devices('GPU')
-if gpus:
-    try:
-        for gpu in gpus:
-            tf.config.experimental.set_memory_growth(gpu, True)
-    except RuntimeError as e:
-        print(e)
-tf.config.optimizer.set_experimental_options({
-    "layout_optimizer": True,
-    "constant_folding": True,
-    "shape_optimization": True,
-    "remapping": True,
-    "arithmetic_optimization": True,
-    "dependency_optimization": True,
-    "loop_optimization": True,
-    "function_optimization": True,
-    "debug_stripper": True,
-    "disable_meta_optimizer": False,
-    "scoped_allocator_optimization": True,
-    "pin_to_host_optimization": True,
-    "auto_parallel" : True
-})
-set_global_policy('mixed_float16')  # Активация mixed precision
-tf.config.optimizer.set_jit(True)
 
-# ====================== КАСТОМНЫЕ КОМПОНЕНТЫ ======================
-class MoE(Layer):
-    def __init__(self, num_experts=8, expert_units=4096, **kwargs):
-        super().__init__(**kwargs)
+# ====================== КОМПОНЕНТЫ МОДЕЛИ ======================
+class MoE(nn.Module):
+    def __init__(self, input_dim, num_experts, expert_units, k_top):
+        super().__init__()
         self.num_experts = num_experts
-        self.expert_units = expert_units
-
-    def build(self, input_shape):
-        self.experts = [self._build_expert(input_shape[-1]) for _ in range(self.num_experts)]
-        self.router = Dense(
-            self.num_experts,
-            activation='softmax',
-            kernel_regularizer=l1_l2(config.l1_value, config.l2_value)
-        )
-        super().build(input_shape)
-
-    def _build_expert(self, input_dim):
-        return tf.keras.Sequential([
-            Dense(self.expert_units, 
-                  activation='swish',
-                  kernel_regularizer=l1_l2(config.l1_value, config.l2_value)),
-            Dropout(config.dropout_rate),
-            Dense(input_dim,
-                  kernel_regularizer=l1_l2(config.l1_value, config.l2_value))
+        self.k_top = k_top
+        self.experts = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(input_dim, expert_units),
+                nn.SiLU(),
+                nn.Dropout(config.dropout),
+                nn.Linear(expert_units, input_dim))
+            for _ in range(num_experts)
         ])
+        self.router = nn.Linear(input_dim, num_experts)
 
-    def call(self, inputs, training=None):
-        # Получаем логиты маршрутизации
-        logits = self.router(inputs)
+    def forward(self, x):
+        logits = self.router(x)
+        top_k_weights, top_k_indices = logits.topk(self.k_top, dim=1)
+        top_k_weights = torch.softmax(top_k_weights, dim=1)
         
-        # Веса экспертов через softmax (тип: float16)
-        weights = K.softmax(logits)
-        
-        # Маска для экспертов (ВАЖНО: приводим к типу weights!)
-        expert_mask = K.cast(
-            weights > 0.1,        # Булев тензор
-            dtype=weights.dtype   # Явно указываем тип как у weights (float16)
+        output = torch.zeros_like(x)
+        for i in range(self.k_top):
+            expert_idx = top_k_indices[:, i]
+            expert_outputs = torch.stack([
+                self.experts[idx](x[batch_idx]) 
+                for batch_idx, idx in enumerate(expert_idx)
+            ])
+            output += expert_outputs * top_k_weights[:, i].unsqueeze(1)
+        return output + x
+
+class SEBlock(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        reduced = max(1, channels // config.se_reduction)
+        self.se = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(channels, reduced, 1),
+            nn.SiLU(),
+            nn.Conv2d(reduced, channels, 1),
+            nn.Sigmoid()
         )
-        
-        # Выходы экспертов (предполагаем, что эксперты возвращают float16)
-        expert_outputs = tf.stack([expert(inputs) for expert in self.experts], axis=1)
-        
-        # Взвешенная сумма (типы weights и expert_mask теперь совпадают)
-        weighted_outputs = tf.einsum('be,beu->bu', weights * expert_mask, expert_outputs)
-        
-        return weighted_outputs + inputs
 
-    def get_config(self):
-        config = super().get_config()
-        config.update({
-            'num_experts': self.num_experts,
-            'expert_units': self.expert_units
-        })
-        return config
+    def forward(self, x):
+        return x * self.se(x)
 
-    @classmethod
-    def from_config(cls, config):
-        return cls(**config)
+class ResidualBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, stride=1):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, 3, stride, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, 3, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.se = SEBlock(out_channels)
+        self.act = nn.SiLU()
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, 1, stride, bias=False),
+                nn.BatchNorm2d(out_channels)
+            )
 
-def focal_loss(y_true, y_pred):
-    y_pred = K.clip(y_pred, K.epsilon(), 1. - K.epsilon())
-    
-    # 1. Кросс-энтропия для истинного класса
-    ce = -y_true * K.log(y_pred)  # [batch, num_classes]
-    ce = K.sum(ce, axis=-1)       # [batch,] (сумма только по активному классу)
-    
-    # 2. Вероятность истинного класса
-    p_t = K.sum(y_true * y_pred, axis=-1)  # [batch,]
-    
-    # 3. Модулятор gamma
-    modulator = K.pow(1. - p_t, config.focal_gamma)  # [batch,]
-    
-    # 4. Итоговый loss (уже имеет размерность [batch,])
-    loss = modulator * ce
-    
-    # Возвращаем среднее по батчу (корректно для Keras)
-    return K.mean(loss)
+    def forward(self, x):
+        residual = self.shortcut(x)
+        x = self.act(self.bn1(self.conv1(x)))
+        x = self.bn2(self.conv2(x))
+        x = self.se(x)
+        return self.act(x + residual)
 
-def se_block(input_tensor):
-    channels = input_tensor.shape[-1]
-    se = GlobalAveragePooling2D()(input_tensor)
-    se = Reshape((1, 1, channels))(se)
-    se = Dense(channels//config.se_reduction, activation='swish',
-               kernel_regularizer=l1_l2(config.l1_value, config.l2_value))(se)
-    se = Dense(channels, activation='sigmoid',
-               kernel_regularizer=l1_l2(config.l1_value, config.l2_value))(se)
-    return Multiply()([input_tensor, se])
+class AnimeClassifier(nn.Module):
+    def __init__(self, num_classes):
+        super().__init__()
+        self.backbone = nn.Sequential(
+            nn.Conv2d(3, 64, 7, stride=2, padding=3, bias=False),
+            nn.BatchNorm2d(64),
+            nn.SiLU(),
+            nn.MaxPool2d(3, stride=2, padding=1),
+            ResidualBlock(64, 64),
+            ResidualBlock(64, 128, stride=2),
+            ResidualBlock(128, 256, stride=2),
+            ResidualBlock(256, 512, stride=2),
+            nn.AdaptiveAvgPool2d(1)
+        )
+        self.moe = MoE(512, config.num_experts, config.expert_units, config.k_top_expert)
+        self.head = nn.Sequential(
+            nn.Dropout(config.dropout),
+            nn.Linear(512, num_classes)
+        )
 
-def residual_block(x, filters, stride=1):
-    shortcut = x
-    if stride != 1 or shortcut.shape[-1] != filters:
-        shortcut = Conv2D(filters, (1,1), strides=stride,
-                          kernel_regularizer=l1_l2(config.l1_value, config.l2_value))(shortcut)
-        shortcut = BatchNormalization()(shortcut)
-    
-    x = Conv2D(filters, (3,3), strides=stride, padding='same',
-               kernel_regularizer=l1_l2(config.l1_value, config.l2_value))(x)
-    x = BatchNormalization()(x)
-    x = Activation('swish')(x)
-    x = Conv2D(filters, (3,3), padding='same',
-               kernel_regularizer=l1_l2(config.l1_value, config.l2_value))(x)
-    x = BatchNormalization()(x)
-    x = se_block(x)
-    return Activation('swish')(Add()([x, shortcut]))
-
-# ====================== ПОСТРОЕНИЕ МОДЕЛИ ======================
-def build_model(num_classes):
-    inputs = Input(shape=config.input_shape)
-    
-    # Бэкбон CNN
-    x = Conv2D(64, (7,7), strides=2, padding='same',
-               kernel_regularizer=l1_l2(config.l1_value, config.l2_value))(inputs)
-    x = BatchNormalization()(x)
-    x = Activation('swish')(x)
-    x = MaxPooling2D((3,3), strides=2, padding='same')(x)
-    
-    # Residual Blocks
-    x = residual_block(x, 64)
-    x = residual_block(x, 64)
-    x = residual_block(x, 128, stride=2)
-    x = residual_block(x, 256, stride=2)
-    x = residual_block(x, 512, stride=2)
-    x = residual_block(x, 512)
-    
-    # Головная часть
-    x = GlobalAveragePooling2D()(x)
-    x = LayerNormalization()(x)
-    x = Dense(2048, activation='swish',
-              kernel_regularizer=l1_l2(config.l1_value, config.l2_value))(x)
-    x = Dropout(config.dropout_rate)(x)
-    x = MoE(config.num_experts, config.expert_units)(x)
-    
-    outputs = Dense(num_classes, activation='softmax', dtype='float32')(x)
-    
-    model = Model(inputs, outputs, name='AnimeClassifier')
-    optimizer = SGD(learning_rate=config.initial_learning_rate,
-                    momentum=0.95, 
-                    nesterov=True)
-    optimizer = tf.keras.mixed_precision.LossScaleOptimizer(optimizer)
-    model.compile(optimizer=optimizer,
-                  loss=focal_loss,
-                  metrics=['accuracy', 'precision', 'recall', 'auc', 'top_k_categorical_accuracy'])
-    return model
+    def forward(self, x):
+        x = self.backbone(x).flatten(1)
+        x = self.moe(x)
+        return self.head(x)
 
 # ====================== ОБРАБОТКА ДАННЫХ ======================
-def create_dataset(subset):
-    return tf.keras.utils.image_dataset_from_directory(
-        config.source_dir,
-        labels='inferred',
-        label_mode='categorical',
-        color_mode='rgb',
-        batch_size=config.batch_size,
-        image_size=config.input_shape[:2],
-        validation_split=config.validation_split,
-        subset=subset,
-        seed=config.augment_seed,
-        shuffle=(subset == 'training')
-    )
+class ImageDataset(Dataset):
+    def __init__(self, root, transform=None, mode='train'):
+        self.classes = sorted(os.listdir(root))
+        self.samples = []
+        for label, cls in enumerate(self.classes):
+            self.samples.extend([(f, label) for f in glob(os.path.join(root, cls, '*'))])
+        self.transform = transform or self._get_transforms(mode)
 
-class EpochSpacingCallback(Callback):
-    def on_epoch_end(self, epoch, logs=None):
-        print('\n' + '=' * 100 + '\n')
+    def __len__(self): 
+        return len(self.samples)
 
-# ====================== ОБУЧЕНИЕ МОДЕЛИ ======================
+    def __getitem__(self, idx):
+        img_path, label = self.samples[idx]
+        img = Image.open(img_path).convert('RGB')
+        return self.transform(img), label
+
+    @staticmethod
+    def _get_transforms(mode):
+        if mode == 'train':
+            return transforms.Compose([
+                transforms.RandomRotation(30),  # Поворот
+                transforms.RandomResizedCrop(config.input_size, scale=(0.8, 1.0)),  # Случайный зум
+                transforms.RandomHorizontalFlip(),  # Отражение
+
+                transforms.ColorJitter(  # Яркость, контраст, насыщенность
+                    brightness=0.2,
+                    contrast=0.2,
+                    saturation=0.2
+                ),
+
+                transforms.ToTensor(),
+            ])
+        return transforms.Compose([
+            transforms.Resize(256),
+            transforms.CenterCrop(config.input_size),
+            transforms.ToTensor(),
+        ])
+
+# ====================== ОБУЧЕНИЕ ======================
+def focal_loss(outputs, targets, gamma=5):
+    ce_loss = nn.CrossEntropyLoss(reduction='none')(outputs, targets)
+    pt = torch.exp(-ce_loss)
+    return ((1 - pt)**gamma * ce_loss).mean()
+
 def run_training():
+    # Включение оптимизации cuDNN
+    torch.backends.cudnn.benchmark = True
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     os.makedirs(os.path.dirname(config.checkpoint_path), exist_ok=True)
-    train_ds_raw = create_dataset('training')
-    val_ds_raw = create_dataset('validation')
-    num_classes = len(train_ds_raw.class_names)
-    save_labels(train_ds_raw.class_names)
 
-    # Предобработка данных
-    def static_preprocessing(image, label):
-        image = tf.cast(image, tf.float32) / 255.0
-        return image, label
+    full_dataset = ImageDataset(config.source_dir)
+    train_size = int((1 - config.val_split) * len(full_dataset))
+    train_ds, val_ds = torch.utils.data.random_split(full_dataset, [train_size, len(full_dataset) - train_size])
 
-    augmentations = tf.keras.Sequential([
-        RandomRotation(config.rotation_range),
-        RandomZoom(config.zoom_range),
-        RandomContrast(config.contrast_range),
-        RandomBrightness(config.brightness_range),
-        RandomFlip('horizontal'),
-        RandomCrop(config.input_shape[0], config.input_shape[1]),  # Случайная обрезка
-        RandomSaturation(config.saturation_range),  # Изменение насыщенности
-    ])
+    train_loader = DataLoader(train_ds, batch_size=config.batch_size, shuffle=True, num_workers=os.cpu_count(), persistent_workers=True, prefetch_factor=2, pin_memory=True)
+    val_loader = DataLoader(val_ds, batch_size=config.batch_size, num_workers=os.cpu_count(), persistent_workers=True, prefetch_factor=2, pin_memory=True)
 
-    train_ds = (
-        train_ds_raw
-        .map(lambda x, y: (augmentations(x, training=True), y), num_parallel_calls=tf.data.AUTOTUNE)  # Аугментация
-        .map(static_preprocessing, num_parallel_calls=tf.data.AUTOTUNE)  # Нормализация
-        .prefetch(tf.data.AUTOTUNE)
+    with open(config.labels_path, 'w') as f:
+        f.write('\n'.join(full_dataset.classes))
+
+    model = AnimeClassifier(len(full_dataset.classes)).to(device)
+    # Оптимизация модели
+    model = torch.compile(
+        model,
+        mode="default",       # Режим оптимизации
+        dynamic=False,        # Динамические формы тензоров (PyTorch 2.1+)
+        fullgraph=False       # Требовать полной компиляции всего графа (если возможно)
     )
+    torch.save(model.state_dict(), config.checkpoint_path)
+    summary(model, (3, 224, 224)) 
+    optimizer = optim.AdamW(model.parameters(), lr=config.lr)
+    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.epochs)
+    plateau_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=config.factor_lr, patience=config.patience_lr)
+    scaler = torch.amp.GradScaler('cuda', enabled=config.mixed_precision and torch.cuda.is_available())
 
-    val_ds = (
-        val_ds_raw
-        .map(static_preprocessing, num_parallel_calls=tf.data.AUTOTUNE)  # Нормализация
-        .prefetch(tf.data.AUTOTUNE)
-    )
+    best_loss = float('inf')
+    early_stop_counter = 0
+    best_epoch = 0
 
-    # Веса классов
-    labels = np.concatenate([y.numpy().argmax(axis=1) for x, y in train_ds_raw], axis=0)
-    total_samples = len(labels)
-    class_counts = np.bincount(labels)
-    class_weights = (total_samples / (len(np.unique(labels)) * class_counts)) ** config.class_weight_gamma
-    class_weights = class_weights.astype(np.float32)
-    class_weights /= class_weights.max()
-    class_weights_dict = {i: w for i, w in enumerate(class_weights)}
+    start_time = time.time()  # Засекаем время начала
 
-    # Инициализация модели
-    if os.path.exists(config.checkpoint_path):
-        model = load_model(
-            config.checkpoint_path,
-            custom_objects={
-                'MoE': MoE,
-                'focal_loss': focal_loss,
-                'LayerNormalization': LayerNormalization
-            }
-        )
-        if model.output_shape[-1] != num_classes:
-            raise ValueError("Несоответствие количества классов!")
-    else:
-        model = build_model(num_classes)
-        model.summary()
+    for epoch in range(config.epochs):
+        model.train()
+        train_loss = 0.0
+        train_correct, train_total = 0, 0
 
-    callbacks = [
-        ReduceLROnPlateau(monitor='val_loss', factor=config.reduce_lr_factor,
-                         patience=config.reduce_lr_patience, min_lr=config.min_learning_rate),
-        ModelCheckpoint(config.checkpoint_path, save_best_only=True, monitor='val_loss'),
-        EarlyStopping(monitor='val_loss', patience=config.early_stopping_patience),
-        EpochSpacingCallback()
-    ]
+        epoch_start_time = time.time()  # Время начала эпохи
+        print(f"\n--- Epoch {epoch + 1}/{config.epochs} ---")
+        for batch_idx, (inputs, labels) in enumerate(train_loader):
+            batch_start_time = time.time()  # Время начала обработки батча
+            inputs, labels = inputs.to(device), labels.to(device)
+            optimizer.zero_grad()
 
-    history = model.fit(
-        train_ds,
-        validation_data=val_ds,
-        epochs=config.epochs,
-        callbacks=callbacks,
-        class_weight=class_weights_dict
-    )
-    return model
+            with torch.amp.autocast('cuda', enabled=config.mixed_precision):
+                outputs = model(inputs)
+                loss = focal_loss(outputs, labels, config.focal_gamma)
+
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
+            train_loss += loss.item()
+            _, predicted = torch.max(outputs, 1)
+            train_total += labels.size(0)
+            train_correct += (predicted == labels).sum().item()
+
+            batch_end_time = time.time()  # Время окончания обработки батча
+            batch_duration = batch_end_time - batch_start_time
+            remaining_batches = len(train_loader) - (batch_idx + 1)
+            estimated_remaining_time = remaining_batches * batch_duration
+            remaining_time_str = time.strftime('%H:%M:%S', time.gmtime(estimated_remaining_time))
+
+            print(
+                f"\r[Train] Epoch {epoch+1}/{config.epochs} | Batch {batch_idx+1}/{len(train_loader)} | "
+                f"Loss: {loss.item():.4f} | Remaining time: {remaining_time_str}",
+                end='', flush=True)
+
+        epoch_end_time = time.time()  # Время окончания эпохи
+        epoch_duration = epoch_end_time - epoch_start_time
+        total_elapsed_time = epoch_end_time - start_time
+        epoch_duration_str = time.strftime("%H:%M:%S", time.gmtime(epoch_duration))
+        total_elapsed_str = time.strftime("%H:%M:%S", time.gmtime(total_elapsed_time))
+
+        print()
+        train_accuracy = 100 * train_correct / train_total
+
+        # Валидация
+        model.eval()
+        val_loss, val_correct, val_total = 0.0, 0, 0
+        all_preds, all_labels = [], []
+
+        with torch.no_grad(), torch.amp.autocast('cuda', enabled=config.mixed_precision):
+            for inputs, labels in val_loader:
+                inputs, labels = inputs.to(device), labels.to(device)
+                outputs = model(inputs)
+
+                val_loss += focal_loss(outputs, labels, config.focal_gamma).item()
+                _, predicted = torch.max(outputs, 1)
+                val_total += labels.size(0)
+                val_correct += (predicted == labels).sum().item()
+
+                all_preds.extend(predicted.cpu().numpy())
+                all_labels.extend(labels.cpu().numpy())
+
+        # Уменьшение скорости обучения      
+        cosine_scheduler.step()
+        plateau_scheduler.step(val_loss)
+        current_lr = optimizer.param_groups[0]['lr']
+
+        # Расчет метрик
+        val_accuracy = 100 * val_correct / val_total
+        val_precision = precision_score(all_labels, all_preds, average='macro', zero_division=0)
+        val_recall = recall_score(all_labels, all_preds, average='macro', zero_division=0)
+        val_f1 = f1_score(all_labels, all_preds, average='macro', zero_division=0)
+
+        # Логирование
+        print(f"[Summary] Train Loss: {train_loss/len(train_loader):.4f} | Acc: {train_accuracy:.2f}%")
+        print(f"[Summary] Val   Loss: {val_loss/len(val_loader):.4f} | Acc: {val_accuracy:.2f}%")
+        print(f"[Summary] Val Precision: {val_precision:.4f} | Recall: {val_recall:.4f} | F1: {val_f1:.4f}")
+        print(f"[Time] Epoch: {epoch_duration_str} | Total: {total_elapsed_str}")
+        print(f"[Summary] LR: {current_lr:.6f}")
+        print()
+
+        # Ранняя остановка
+        if val_loss < best_loss:
+            best_loss = val_loss
+            best_epoch = epoch + 1
+            early_stop_counter = 0
+            torch.save(model.state_dict(), config.checkpoint_path)
+        else:
+            early_stop_counter += 1
+            if early_stop_counter >= config.early_stopping_patience:
+                print("Ранняя остановка!")
+                break
+
+    print(f"\n🏆 Лучшая эпоха: {best_epoch} с валидационным лоссом: {best_loss:.4f}")
 
 # ====================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ======================
-def save_labels(class_names):
-    with open(config.labels_path, "w") as f:
-        for label in class_names: f.write(label + "\n")
-
 def convert_to_onnx():
-    model = load_model(
-        config.checkpoint_path,
-        custom_objects={
-            'MoE': MoE,
-            'focal_loss': focal_loss,
-            'LayerNormalization': LayerNormalization
-        }
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = AnimeClassifier(len(get_classes())).to(device)
+    checkpoint = torch.load(config.checkpoint_path)
+    # Исправление ключей
+    state_dict = {k.replace("_orig_mod.", ""): v for k, v in checkpoint.items()}
+    model.load_state_dict(state_dict)
+    model.eval()
+    
+    dummy_input = torch.randn(1, 3, *config.input_size).to(device)
+    torch.onnx.export(
+        model, 
+        dummy_input, 
+        config.onnx_path,
+        input_names=['input'],
+        output_names=['output'],
+        dynamic_axes={'input': {0: 'batch_size'}, 'output': {0: 'batch_size'}},
+        opset_version=13
     )
-    input_signature = [tf.TensorSpec(shape=[None, *config.input_shape], dtype=tf.float32)]
-    tf2onnx.convert.from_keras(model, input_signature=input_signature, output_path=config.onnx_path)
-    check_onnx_work()
+    print("ONNX модель сохранена:", config.onnx_path)
 
-def check_onnx_work():
-    # Получение меток классов
-    train_ds = tf.keras.utils.image_dataset_from_directory(
-        config.source_dir,
-        image_size=config.input_shape[:2],
-        batch_size=config.batch_size,
-        shuffle=False
-    )
-    class_names = train_ds.class_names
-    with open(config.labels_path, 'w') as f:
-        f.write('\n'.join(class_names))
-
-    # Загрузка ONNX модели
+def test_onnx():
+    if not os.path.exists(config.onnx_path):
+        print("ONNX модель не найдена!")
+        return
+    
     session = ort.InferenceSession(config.onnx_path)
-    input_name = session.get_inputs()[0].name
-
-    # Обработка изображения в папке
-    img_path = "test.jpg"
-
-    # Загрузка изображения без изменения размера
-    img = tf.keras.preprocessing.image.load_img(img_path)
-    img_array = tf.keras.preprocessing.image.img_to_array(img)
-
-    # Добавляем размерность батча и нормализуем
-    img_array = tf.expand_dims(img_array, 0) / 255.0 # Нормализация [0,1]
+    transform = ImageDataset._get_transforms('val')
     
-    # Вывод информации о изображении
-    print(f"\n🔍 Анализ изображения: {img_path}")
-    print(f"Форма входных данных: {img_array.shape}")
-
-    # Выполнение предсказания
-    results = session.run(None, {input_name: img_array.numpy().astype(np.float32)})
-    probabilities = results[0][0]
+    try:
+        img = Image.open("test.jpg").convert('RGB')
+        img_tensor = transform(img).unsqueeze(0).numpy()
+    except FileNotFoundError:
+        print("Файл test.jpg не найден!")
+        return
     
-    # Получение топ-5 предсказаний
-    top5_indices = np.argsort(probabilities)[::-1][:5]
-    top5_classes = [class_names[i] for i in top5_indices]
-    top5_probs = [probabilities[i] for i in top5_indices]
-
-    # Вывод результатов
-    print("\n🔮 Результаты классификации onnx:")
-    for cls, prob in zip(top5_classes, top5_probs):
-        print(f"  {cls}: {prob*100:.2f}%")
-
-    model = load_model(
-        config.checkpoint_path,
-        custom_objects={
-            'MoE': MoE,
-            'focal_loss': focal_loss,
-            'LayerNormalization': LayerNormalization
-        }
-    )
-
-    results = model.predict(img_array)
-
-    probabilities = results[0]
+    outputs = session.run(None, {'input': img_tensor.astype(np.float32)})
+    probs = torch.softmax(torch.tensor(outputs[0]), dim=1)
     
-    # Получение топ-5 предсказаний
-    top5_indices = np.argsort(probabilities)[::-1][:5]
-    top5_classes = [class_names[i] for i in top5_indices]
-    top5_probs = [probabilities[i] for i in top5_indices]
+    with open(config.labels_path) as f:
+        classes = [line.strip() for line in f]
+    
+    print("\nТоп-5 предсказаний:")
+    top_probs, top_indices = torch.topk(probs, 5)
+    for i, (prob, idx) in enumerate(zip(top_probs[0], top_indices[0])):
+        print(f"{i+1}. {classes[idx]}: {prob*100:.2f}%")
 
-    print("\n🔮 Результаты классификации keras:")
-    for cls, prob in zip(top5_classes, top5_probs):
-        print(f"  {cls}: {prob*100:.2f}%")
+def get_classes():
+    with open(config.labels_path) as f:
+        return [line.strip() for line in f]
 
-# ====================== ИНТЕРФЕЙС ПОЛЬЗОВАТЕЛЯ ======================
-def main():
+# ====================== ИНТЕРФЕЙС ======================
+def main_menu():
     while True:
-        print("\nМеню:\n1. Обучить\n2. Конвертировать\n3. Тест ONNX\nexit. Выход")
+        print("\nМеню:")
+        print("1. Обучить модель")
+        print("2. Конвертировать в ONNX")
+        print("3. Протестировать ONNX")
+        print("0. Выход")
         choice = input("Выбор: ").strip()
+        
         if choice == '1':
             run_training()
         elif choice == '2':
             convert_to_onnx()
         elif choice == '3':
-            check_onnx_work()
-        elif choice == 'exit':
+            test_onnx()
+        elif choice == '0':
             break
+        else:
+            print("Неверный ввод!")
 
 if __name__ == "__main__":
-    main()
+    main_menu()
