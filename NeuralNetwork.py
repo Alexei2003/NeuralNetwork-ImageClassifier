@@ -19,7 +19,7 @@ class Config:
     labels_path = "/media/alex/Programs/NeuralNetwork/Model/labels.txt"
     onnx_path = "/media/alex/Programs/NeuralNetwork/Model/model.onnx"
     input_size = (224, 224)
-    num_experts = 8
+    num_experts = 16
     expert_units = 1024
     k_top_expert = 2
     se_reduction = 16
@@ -27,7 +27,7 @@ class Config:
     factor_lr = 0.5
     patience_lr =2
     batch_size = 64
-    epochs = 100
+    epochs = 30
     momentum = 0.95
     focal_gamma = 5
     dropout = 0.5
@@ -46,7 +46,7 @@ class MoE(nn.Module):
         self.experts = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(input_dim, expert_units),
-                nn.SiLU(),
+                nn.SiLU(inplace=True) ,
                 nn.Dropout(config.dropout),
                 nn.Linear(expert_units, input_dim))
             for _ in range(num_experts)
@@ -75,7 +75,7 @@ class SEBlock(nn.Module):
         self.se = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Conv2d(channels, reduced, 1),
-            nn.SiLU(),
+            nn.SiLU(inplace=True) ,
             nn.Conv2d(reduced, channels, 1),
             nn.Sigmoid()
         )
@@ -91,7 +91,9 @@ class ResidualBlock(nn.Module):
         self.conv2 = nn.Conv2d(out_channels, out_channels, 3, padding=1, bias=False)
         self.bn2 = nn.BatchNorm2d(out_channels)
         self.se = SEBlock(out_channels)
-        self.act = nn.SiLU()
+        self.act = nn.SiLU(inplace=True) 
+        self.dropout = nn.Dropout2d(config.dropout)  # Добавлен Dropout
+
         self.shortcut = nn.Sequential()
         if stride != 1 or in_channels != out_channels:
             self.shortcut = nn.Sequential(
@@ -99,9 +101,10 @@ class ResidualBlock(nn.Module):
                 nn.BatchNorm2d(out_channels)
             )
 
-    def forward(self, x):
+    def forward(self, x):      
         residual = self.shortcut(x)
         x = self.act(self.bn1(self.conv1(x)))
+        x = self.dropout(x)  # Добавлен Dropout
         x = self.bn2(self.conv2(x))
         x = self.se(x)
         return self.act(x + residual)
@@ -112,7 +115,7 @@ class AnimeClassifier(nn.Module):
         self.backbone = nn.Sequential(
             nn.Conv2d(3, 64, 7, stride=2, padding=3, bias=False),
             nn.BatchNorm2d(64),
-            nn.SiLU(),
+            nn.SiLU(inplace=True) ,
             nn.MaxPool2d(3, stride=2, padding=1),
             ResidualBlock(64, 64),
             ResidualBlock(64, 128, stride=2),
@@ -162,6 +165,10 @@ class ImageDataset(Dataset):
                     saturation=0.2
                 ),
 
+                transforms.RandomApply([transforms.GaussianBlur(3)], p=0.2),
+                transforms.RandomSolarize(threshold=0.5, p=0.1),
+                transforms.RandomAffine(degrees=0, translate=(0.1, 0.1)),
+
                 transforms.ToTensor(),
             ])
         return transforms.Compose([
@@ -187,8 +194,10 @@ def run_training():
     train_size = int((1 - config.val_split) * len(full_dataset))
     train_ds, val_ds = torch.utils.data.random_split(full_dataset, [train_size, len(full_dataset) - train_size])
 
-    train_loader = DataLoader(train_ds, batch_size=config.batch_size, shuffle=True, num_workers=os.cpu_count(), persistent_workers=True, prefetch_factor=2, pin_memory=True)
-    val_loader = DataLoader(val_ds, batch_size=config.batch_size, num_workers=os.cpu_count(), persistent_workers=True, prefetch_factor=2, pin_memory=True)
+    train_loader = DataLoader(train_ds, batch_size=config.batch_size, shuffle=True, num_workers=os.cpu_count(), persistent_workers=True, 
+                              prefetch_factor=2, pin_memory=True)
+    val_loader = DataLoader(val_ds, batch_size=config.batch_size, num_workers=os.cpu_count(), persistent_workers=True, 
+                            prefetch_factor=2, pin_memory=True)
 
     with open(config.labels_path, 'w') as f:
         f.write('\n'.join(full_dataset.classes))
@@ -231,6 +240,7 @@ def run_training():
                 loss = focal_loss(outputs, labels, config.focal_gamma)
 
             scaler.scale(loss).backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # Gradient Clipping
             scaler.step(optimizer)
             scaler.update()
 
@@ -328,7 +338,10 @@ def convert_to_onnx():
         input_names=['input'],
         output_names=['output'],
         dynamic_axes={'input': {0: 'batch_size'}, 'output': {0: 'batch_size'}},
-        opset_version=13
+        opset_version=13,
+        do_constant_folding=True,
+        training=torch.onnx.TrainingMode.EVAL, 
+        operator_export_type=torch.onnx.OperatorExportTypes.ONNX_ATEN_FALLBACK 
     )
     print("ONNX модель сохранена:", config.onnx_path)
 
