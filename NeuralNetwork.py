@@ -12,32 +12,44 @@ import time
 from torchinfo import summary
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
+import torch.backends.cudnn
+
+torch.backends.cudnn.benchmark = True
 
 # ====================== КОНФИГУРАЦИЯ ======================
 class Config:
-    source_dir = "/media/alex/Programs/NeuralNetwork/DataSet/ARTS/Original"
-    checkpoint_path = "/media/alex/Programs/NeuralNetwork/Model/best_model.pth"
-    labels_path = "/media/alex/Programs/NeuralNetwork/Model/labels.txt"
-    onnx_path = "/media/alex/Programs/NeuralNetwork/Model/model.onnx"
+    # Пути к данным и моделям
+    source_dir = "/media/alex/Programs/NeuralNetwork/DataSet/ARTS/Original"  # Папка с исходными изображениями
+    checkpoint_path = "/media/alex/Programs/NeuralNetwork/Model/best_model.pth"  # Путь для сохранения/загрузки модели
+    labels_path = "/media/alex/Programs/NeuralNetwork/Model/labels.txt"  # Файл с метками классов
+    onnx_path = "/media/alex/Programs/NeuralNetwork/Model/model.onnx"  # Путь для экспортированной модели в ONNX формате
 
-    resume_training = False  # Новый флаг
+    # Флаги управления обучением
+    resume_training = False  # Продолжать обучение с сохраненного чекпоинта, если True
 
-    input_size = (224, 224)
-    num_experts = 8
-    expert_units = 1024
-    k_top_expert = 2
-    se_reduction = 16
-    lr = 1e-2
-    factor_lr = 0.5
-    patience_lr =2
-    batch_size = 64
-    epochs = 30
-    momentum = 0.95
-    focal_gamma = 5
-    dropout = 0.5
-    mixed_precision = True
-    early_stopping_patience = 10
-    val_split = 0.2
+    # Параметры входных данных
+    input_size = (224, 224)  # Размер входного изображения (ширина, высота)
+
+    # Архитектура модели и гиперпараметры
+    num_experts = 8          # Количество экспертов в MoE (Mixture of Experts)
+    expert_units = 1024      # Количество нейронов в каждом эксперте
+    k_top_expert = 2         # Количество активных экспертов на один пример
+    se_reduction = 16        # Коэффициент редукции для SE (Squeeze-and-Excitation) блока
+    dropout = 0.5            # Вероятность отключения нейронов (dropout)
+
+    # Параметры обучения
+    lr = 0.01                # Начальная скорость обучения (learning rate)
+    batch_size = 64          # Размер батча
+    epochs = 30              # Количество эпох обучения
+    momentum = 0.95          # Моментум для оптимизатора (например, SGD)
+    focal_gamma = 5          # Гамма для Focal Loss (усиление обучения на сложных примерах)
+
+    # Настройки оптимизации и контроля обучения
+    mixed_precision = True   # Использовать смешанную точность (fp16) для ускорения обучения
+    early_stopping_patience = 10  # Количество эпох без улучшения для ранней остановки
+    val_split = 0.2          # Доля данных, выделяемая под валидацию
+    factor_lr = 0.1          # Коэффициент уменьшения learning rate при plateau
+    patience_lr = 2          # Количество эпох без улучшения для снижения learning rate
 
 config = Config()
 
@@ -223,6 +235,12 @@ def focal_loss(outputs, targets, gamma=5):
     pt = torch.clamp(torch.exp(-ce_loss), min=1e-7, max=1-1e-7)  # Защита от переполнения
     return ((1 - pt)**gamma * ce_loss).mean()
 
+def compile_model(model):
+    return torch.compile(model, 
+                         mode="max-autotune", 
+                         dynamic=False, 
+                         fullgraph=False)
+
 def run_training():
     # Включение оптимизации cuDNN
     torch.backends.cudnn.benchmark = True
@@ -252,15 +270,31 @@ def run_training():
     train_size = int((1 - config.val_split) * len(full_dataset))
     train_ds, val_ds = torch.utils.data.random_split(full_dataset, [train_size, len(full_dataset) - train_size])
 
-    train_loader = DataLoader(train_ds, batch_size=config.batch_size, shuffle=True, num_workers=os.cpu_count(), persistent_workers=True, 
-                              prefetch_factor=2, pin_memory=True)
-    val_loader = DataLoader(val_ds, batch_size=config.batch_size, num_workers=os.cpu_count(), persistent_workers=True, 
-                            prefetch_factor=2, pin_memory=True)
+    train_loader = DataLoader(
+        train_ds, 
+        batch_size=config.batch_size, 
+        shuffle=True, 
+        num_workers=os.cpu_count(), 
+        persistent_workers=True,            
+        prefetch_factor=2, 
+        pin_memory=True)
+    val_loader = DataLoader(
+        val_ds, 
+        batch_size=config.batch_size, 
+        num_workers=os.cpu_count(), 
+        persistent_workers=True, 
+        prefetch_factor=2, 
+        pin_memory=True)
 
     model = AnimeClassifier(len(full_dataset.classes)).to(device)
 
     optimizer = optim.AdamW(model.parameters(), lr=config.lr)
-    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.epochs)
+    plateau_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode='min',
+        factor=config.factor_lr,         # Во сколько раз уменьшать LR
+        patience=config.patience_lr,     # Сколько эпох ждать без улучшения
+    )
     scaler = torch.amp.GradScaler('cuda', enabled=config.mixed_precision and torch.cuda.is_available())
     start_epoch = 0
     best_loss = float('inf')
@@ -328,36 +362,22 @@ def run_training():
             
             optimizer.load_state_dict(new_optimizer_state)
 
-            # Обновляем планировщики
-            cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.epochs)
-
             # Компиляция модели
-            model = torch.compile(
-                model,
-                mode="default",
-                dynamic=False,
-                fullgraph=False
-            )
+            compile_model(model)
 
             # Восстановление остальных состояний
             start_epoch = checkpoint['epoch'] + 1
             best_loss = checkpoint['best_loss']
             early_stop_counter = checkpoint['early_stop_counter']
 
-            print(f"🔄 Старт дообучения, новых классов: {current_num_classes - saved_num_classes}")
-            
+            print(f"🔄 Старт дообучения, новых классов: {current_num_classes - saved_num_classes}")     
         else:
             # Оптимизация модели
-            model = torch.compile(
-                model,
-                mode="default",       # Режим оптимизации
-                dynamic=False,        # Динамические формы тензоров (PyTorch 2.1+)
-                fullgraph=False       # Требовать полной компиляции всего графа (если возможно)
-            )
+            compile_model(model)
 
             #4. Восстановление состояний
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            cosine_scheduler.load_state_dict(checkpoint['scheduler_cosine'])
+            plateau_scheduler.load_state_dict(checkpoint['scheduler_plateau'])
             scaler.load_state_dict(checkpoint['scaler_state_dict'])
             start_epoch = checkpoint['epoch'] + 1
             best_loss = checkpoint['best_loss']
@@ -365,18 +385,13 @@ def run_training():
             print(f"🔄 Продолжение обучения с эпохи {start_epoch}")
     else:
         # Оптимизация модели
-        model = torch.compile(
-            model,
-            mode="default",       # Режим оптимизации
-            dynamic=False,        # Динамические формы тензоров (PyTorch 2.1+)
-            fullgraph=False       # Требовать полной компиляции всего графа (если возможно)
-        )
+        compile_model(model)
 
         torch.save({
             'epoch': -1,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
-            'scheduler_cosine': cosine_scheduler.state_dict(),
+            'scheduler_plateau': plateau_scheduler.state_dict(), 
             'scaler_state_dict': scaler.state_dict(),
             'best_loss': best_loss,
             'early_stop_counter': early_stop_counter,
@@ -470,8 +485,7 @@ def run_training():
         print() 
 
         # Уменьшение скорости обучения      
-        cosine_scheduler.step()
-        current_lr = optimizer.param_groups[0]['lr']
+        plateau_scheduler.step(val_loss)
 
         # Расчет метрик
         val_accuracy = 100 * val_correct / val_total
@@ -484,7 +498,8 @@ def run_training():
         print(f"[Summary] Val   Loss: {val_loss/len(val_loader):.4f} | Acc: {val_accuracy:.2f}%")
         print(f"[Summary] Val Precision: {val_precision:.4f} | Recall: {val_recall:.4f} | F1: {val_f1:.4f}")
         print(f"[Time] Epoch: {epoch_duration_str} | Total: {total_elapsed_str}")
-        print(f"[Summary] LR: {current_lr:.6f}")
+        current_lr = optimizer.param_groups[0]['lr']
+        print(f"[Summary] LR: {current_lr:.10f}")
         print()
 
         # Ранняя остановка
@@ -495,7 +510,7 @@ def run_training():
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_cosine': cosine_scheduler.state_dict(),
+                'scheduler_plateau': plateau_scheduler.state_dict(), 
                 'scaler_state_dict': scaler.state_dict(),
                 'best_loss': best_loss,
                 'early_stop_counter': early_stop_counter,
@@ -548,7 +563,6 @@ def test_onnx():
     
     # Загрузка ONNX-модели
     session = ort.InferenceSession(config.onnx_path)
-    transform = ImageDataset._get_transforms('val')
     
     try:
         img = Image.open("test.jpg").convert('RGB')
