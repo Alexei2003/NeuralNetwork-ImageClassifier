@@ -14,42 +14,41 @@ import albumentations as A
 from albumentations.pytorch import ToTensorV2
 import torch.backends.cudnn
 
-torch.backends.cudnn.benchmark = True
-
 # ====================== КОНФИГУРАЦИЯ ======================
 class Config:
     # Пути к данным и моделям
-    source_dir = "/media/alex/Programs/NeuralNetwork/DataSet/ARTS/Original"  # Папка с исходными изображениями
-    checkpoint_path = "/media/alex/Programs/NeuralNetwork/Model/best_model.pth"  # Путь для сохранения/загрузки модели
-    labels_path = "/media/alex/Programs/NeuralNetwork/Model/labels.txt"  # Файл с метками классов
-    onnx_path = "/media/alex/Programs/NeuralNetwork/Model/model.onnx"  # Путь для экспортированной модели в ONNX формате
+    source_dir = "/media/alex/Programs/NeuralNetwork/DataSet/ARTS/Original"         # Папка с исходными изображениями
+    checkpoint_path = "/media/alex/Programs/NeuralNetwork/Model/best_model.pth"     # Путь для сохранения/загрузки модели
+    labels_path = "/media/alex/Programs/NeuralNetwork/Model/labels.txt"             # Файл с метками классов
+    onnx_path = "/media/alex/Programs/NeuralNetwork/Model/model.onnx"               # Путь для экспортированной модели в ONNX формате
 
     # Флаги управления обучением
-    resume_training = False  # Продолжать обучение с сохраненного чекпоинта, если True
+    resume_training = False         # Продолжать обучение с сохраненного чекпоинта, если True
 
     # Параметры входных данных
-    input_size = (224, 224)  # Размер входного изображения (ширина, высота)
+    input_size = (224, 224)         # Размер входного изображения (ширина, высота)
 
     # Архитектура модели и гиперпараметры
-    num_experts = 8          # Количество экспертов в MoE (Mixture of Experts)
-    expert_units = 1024      # Количество нейронов в каждом эксперте
-    k_top_expert = 2         # Количество активных экспертов на один пример
-    se_reduction = 16        # Коэффициент редукции для SE (Squeeze-and-Excitation) блока
-    dropout = 0.5            # Вероятность отключения нейронов (dropout)
+    num_experts = 8                 # Количество экспертов в MoE (Mixture of Experts)
+    expert_units = 1024             # Количество нейронов в каждом эксперте
+    k_top_expert = 2                # Количество активных экспертов на один пример
+    se_reduction = 16               # Коэффициент редукции для SE (Squeeze-and-Excitation) блока
+    dropout = 0.5                   # Вероятность отключения нейронов (dropout)
 
     # Параметры обучения
-    lr = 0.01                # Начальная скорость обучения (learning rate)
-    batch_size = 64          # Размер батча
-    epochs = 30              # Количество эпох обучения
-    momentum = 0.95          # Моментум для оптимизатора (например, SGD)
-    focal_gamma = 5          # Гамма для Focal Loss (усиление обучения на сложных примерах)
+    accumulation_steps = 5          # Количество шагов накопления градиентов (для эффективного увеличения размера батча без увеличения памяти)
+    lr = 0.01 * accumulation_steps  # Начальная скорость обучения (learning rate), масштабируется под accumulation_steps для стабильности
+    batch_size = 100                # Размер батча (число примеров, обрабатываемых за один проход)
+    epochs = 100                    # Количество эпох обучения (полных проходов по всему датасету)
+    focal_gamma = 5                 # Параметр гамма для Focal Loss, регулирует степень фокусировки на сложных примерах
+    smoothing = 0.1                 # Параметр label smoothing, задаёт уровень сглаживания меток для улучшения обобщения
 
     # Настройки оптимизации и контроля обучения
-    mixed_precision = True   # Использовать смешанную точность (fp16) для ускорения обучения
-    early_stopping_patience = 10  # Количество эпох без улучшения для ранней остановки
-    val_split = 0.2          # Доля данных, выделяемая под валидацию
-    factor_lr = 0.1          # Коэффициент уменьшения learning rate при plateau
-    patience_lr = 2          # Количество эпох без улучшения для снижения learning rate
+    mixed_precision = True          # Использовать смешанную точность (fp16) для ускорения обучения
+    early_stopping_patience = 5     # Количество эпох без улучшения для ранней остановки
+    val_split = 0.2                 # Доля данных, выделяемая под валидацию
+    factor_lr = 0.5                 # Коэффициент уменьшения learning rate при plateau
+    patience_lr = 1                 # Количество эпох без улучшения для снижения learning rate
 
 config = Config()
 
@@ -230,18 +229,34 @@ class ImageDataset(Dataset):
         ])
 
 # ====================== ОБУЧЕНИЕ ======================
-def focal_loss(outputs, targets, gamma=5):
-    ce_loss = nn.CrossEntropyLoss(reduction='none')(outputs, targets)
-    pt = torch.clamp(torch.exp(-ce_loss), min=1e-7, max=1-1e-7)  # Защита от переполнения
-    return ((1 - pt)**gamma * ce_loss).mean()
+def focal_loss_with_smoothing(outputs, targets, gamma=5.0, smoothing=0.1):
+    num_classes = outputs.size(1)
+    confidence = 1.0 - smoothing
+
+    log_probs = torch.nn.functional.log_softmax(outputs, dim=-1)
+    probs = torch.exp(log_probs)
+
+    # Сглаженные one-hot метки
+    true_dist = torch.full_like(log_probs, smoothing / (num_classes - 1))
+    true_dist.scatter_(1, targets.unsqueeze(1), confidence)
+
+    pt = torch.sum(true_dist * probs, dim=-1)
+    focal_factor = (1 - pt).pow(gamma)
+
+    loss = -torch.sum(true_dist * log_probs, dim=-1)
+    return torch.mean(focal_factor * loss)
 
 def compile_model(model):
-    return torch.compile(model, 
+    torch.compile(model, 
                          mode="max-autotune", 
                          dynamic=False, 
                          fullgraph=False)
+    torch.cuda.empty_cache()  
 
 def run_training():
+    # Оптимизация матричных операций (НОВОЕ)
+    torch.set_float32_matmul_precision('medium')
+
     # Включение оптимизации cuDNN
     torch.backends.cudnn.benchmark = True
 
@@ -255,7 +270,10 @@ def run_training():
         current_classes = sorted(os.listdir(config.source_dir))
         new_classes = [cls for cls in current_classes if cls not in old_classes]
         full_classes = old_classes + new_classes
-        print("Добавлены новые классы в файл")
+        if new_classes:
+            print(f"Добавлены новые классы в файл: {', '.join(new_classes)}")
+        else:
+            print("Новых классов не найдено.")
     else:
         full_classes = sorted(os.listdir(config.source_dir))
 
@@ -286,7 +304,7 @@ def run_training():
         prefetch_factor=2, 
         pin_memory=True)
 
-    model = AnimeClassifier(len(full_dataset.classes)).to(device)
+    model = AnimeClassifier(len(full_classes)).to(device)
 
     optimizer = optim.AdamW(model.parameters(), lr=config.lr)
     plateau_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -401,42 +419,65 @@ def run_training():
 
     start_time = time.time()  # Засекаем время начала
 
+    optimizer.zero_grad(set_to_none=True)  # Инициализация градиентов
     for epoch in range(start_epoch, config.epochs):
         model.train()
         train_loss = 0.0
         train_correct, train_total = 0, 0
+        optimizer.zero_grad() 
+        accumulated_loss = 0.0  # Для агрегации потерь при накоплении
 
         epoch_start_time = time.time()  # Время начала эпохи
-        print(f"\n--- Epoch {epoch + 1}/{config.epochs} ---")
         for batch_idx, (inputs, labels) in enumerate(train_loader):
             batch_start_time = time.time()  # Время начала обработки батча
             inputs, labels = inputs.to(device), labels.to(device)
-            optimizer.zero_grad()
-
+            
             with torch.amp.autocast('cuda', enabled=config.mixed_precision):
                 outputs = model(inputs)
-                loss = focal_loss(outputs, labels, config.focal_gamma)
-
+                loss = focal_loss_with_smoothing(outputs, labels, config.focal_gamma, config.smoothing) / config.accumulation_steps
+            
+            # Накопление градиентов (основное изменение)
             scaler.scale(loss).backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # Gradient Clipping
-            scaler.step(optimizer)
-            scaler.update()
+            accumulated_loss += loss.item() * config.accumulation_steps
+            
+            # Обновление только на последнем шаге накопления
+            if (batch_idx + 1) % config.accumulation_steps == 0 or (batch_idx + 1) == len(train_loader):
+                # Градиентный клиппинг
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                
+                # Шаг оптимизатора
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+                
+                # Расчет метрик только при обновлении
+                _, predicted = torch.max(outputs, 1)
+                current_batch_size = labels.size(0)
+                train_total += current_batch_size
+                train_correct += (predicted == labels).sum().item()
+                
+                # Логирование только при обновлении
+                batch_loss_value = accumulated_loss
+                train_loss += batch_loss_value
+                
+                # Сброс накопленных потерь
+                accumulated_loss = 0.0
+                
+                # Расчет времени для логирования
+                batch_end_time = time.time()
+                batch_duration = batch_end_time - batch_start_time
+                remaining_batches = len(train_loader) - (batch_idx + 1)
+                estimated_remaining_time = remaining_batches * batch_duration
+                remaining_time_str = time.strftime('%H:%M:%S', time.gmtime(estimated_remaining_time))
 
-            train_loss += loss.item()
-            _, predicted = torch.max(outputs, 1)
-            train_total += labels.size(0)
-            train_correct += (predicted == labels).sum().item()
-
-            batch_end_time = time.time()  # Время окончания обработки батча
-            batch_duration = batch_end_time - batch_start_time
-            remaining_batches = len(train_loader) - (batch_idx + 1)
-            estimated_remaining_time = remaining_batches * batch_duration
-            remaining_time_str = time.strftime('%H:%M:%S', time.gmtime(estimated_remaining_time))
-
-            print(
-                f"\r[Train] Epoch {epoch+1}/{config.epochs} | Batch {batch_idx+1}/{len(train_loader)} | "
-                f"Loss: {loss.item():.4f} | Remaining time: {remaining_time_str}",
-                end='', flush=True)
+                print(
+                    f"\r[Train] Epoch {epoch+1}/{config.epochs} | Batch {batch_idx+1}/{len(train_loader)} | "
+                    f"Loss: {batch_loss_value:.4f} | Remaining time: {remaining_time_str}",
+                    end='', flush=True)
+            else:
+                # Пропускаем логирование на промежуточных шагах
+                continue
 
         epoch_end_time = time.time()  # Время окончания эпохи
         epoch_duration = epoch_end_time - epoch_start_time
@@ -460,7 +501,7 @@ def run_training():
                 inputs, labels = inputs.to(device), labels.to(device)
                 outputs = model(inputs)
                 
-                loss = focal_loss(outputs, labels, config.focal_gamma)
+                loss = focal_loss_with_smoothing(outputs, labels, config.focal_gamma, config.smoothing)
                 val_loss += loss.item()
                 
                 _, predicted = torch.max(outputs, 1)
