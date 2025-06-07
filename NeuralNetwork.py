@@ -37,11 +37,12 @@ class Config:
 
     # Параметры обучения
     accumulation_steps = 5          # Количество шагов накопления градиентов (для эффективного увеличения размера батча без увеличения памяти)
-    lr = 0.01 * accumulation_steps  # Начальная скорость обучения (learning rate), масштабируется под accumulation_steps для стабильности
+    lr = 0.004 * accumulation_steps # Начальная скорость обучения (learning rate), масштабируется под accumulation_steps для стабильности
     batch_size = 100                # Размер батча (число примеров, обрабатываемых за один проход)
     epochs = 100                    # Количество эпох обучения (полных проходов по всему датасету)
     focal_gamma = 5                 # Параметр гамма для Focal Loss, регулирует степень фокусировки на сложных примерах
     smoothing = 0.1                 # Параметр label smoothing, задаёт уровень сглаживания меток для улучшения обобщения
+    threshold = 1e-2                # Разница val loss для уменьшения learning rate
 
     # Настройки оптимизации и контроля обучения
     mixed_precision = True          # Использовать смешанную точность (fp16) для ускорения обучения
@@ -248,9 +249,9 @@ def focal_loss_with_smoothing(outputs, targets, gamma=5.0, smoothing=0.1):
 
 def compile_model(model):
     torch.compile(model, 
-                         mode="max-autotune", 
-                         dynamic=False, 
-                         fullgraph=False)
+        mode="max-autotune", 
+        dynamic=False, 
+        fullgraph=False)
     torch.cuda.empty_cache()  
 
 def run_training():
@@ -310,8 +311,11 @@ def run_training():
     plateau_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
         mode='min',
-        factor=config.factor_lr,         # Во сколько раз уменьшать LR
-        patience=config.patience_lr,     # Сколько эпох ждать без улучшения
+        factor=config.factor_lr,
+        patience=config.patience_lr,
+        threshold=config.threshold, # ← игнорирует минимальные изменения
+        threshold_mode='rel',       # ← относительное сравнение
+        verbose=True                # ← печатает сообщение при снижении LR
     )
     scaler = torch.amp.GradScaler('cuda', enabled=config.mixed_precision and torch.cuda.is_available())
     start_epoch = 0
@@ -501,7 +505,7 @@ def run_training():
                 inputs, labels = inputs.to(device), labels.to(device)
                 outputs = model(inputs)
                 
-                loss = focal_loss_with_smoothing(outputs, labels, config.focal_gamma, config.smoothing)
+                loss = focal_loss_with_smoothing(outputs, labels, config.focal_gamma, config.smoothing) 
                 val_loss += loss.item()
                 
                 _, predicted = torch.max(outputs, 1)
