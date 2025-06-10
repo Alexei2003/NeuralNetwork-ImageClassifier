@@ -169,29 +169,7 @@ class AnimeClassifier(nn.Module):
         x = self.moe(x)
         return self.head(x)
 
-# ====================== ОБРАБОТКА ДАННЫХ ======================
-def stratified_split(dataset, val_split=0.2):
-    label_to_indices = defaultdict(list)
-
-    # 1. Группируем индексы по классам
-    for idx, (_, label) in enumerate(dataset):
-        label_to_indices[label].append(idx)
-
-    train_indices = []
-    val_indices = []
-
-    # 2. Для каждого класса отдельно
-    for label, indices in label_to_indices.items():
-        random.shuffle(indices)           # Перемешиваем индексы для случайности
-        n_val = int(len(indices) * val_split)  # Вычисляем сколько взять в validation
-        val_indices.extend(indices[:n_val])    # Первые n_val — в validation
-        train_indices.extend(indices[n_val:])  # Остальные — в train
-
-    # 3. Создаём подмножества с нужными индексами
-    train_ds = Subset(dataset, train_indices)
-    val_ds = Subset(dataset, val_indices)
-    return train_ds, val_ds
-    
+# ====================== ОБРАБОТКА ДАННЫХ ======================   
 class ImageDataset(Dataset):
     def __init__(self, root, transform=None, mode='train'):
         if os.path.exists(config.labels_path):
@@ -323,7 +301,7 @@ def run_training():
     full_dataset.classes = full_classes  # Переопределяем порядок
 
     train_size = int((1 - config.val_split) * len(full_dataset))
-    train_ds, val_ds = stratified_split(full_dataset, val_split=config.val_split)
+    train_ds, val_ds = torch.utils.data.random_split(full_dataset, [train_size, len(full_dataset) - train_size])
     class_weights = get_class_weights(train_ds).to(device)
 
     train_loader = DataLoader(
