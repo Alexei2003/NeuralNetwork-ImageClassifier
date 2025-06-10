@@ -13,6 +13,7 @@ from torchinfo import summary
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 import torch.backends.cudnn
+from collections import Counter
 
 # ====================== КОНФИГУРАЦИЯ ======================
 class Config:
@@ -49,7 +50,7 @@ class Config:
     early_stopping_patience = 5     # Количество эпох без улучшения для ранней остановки
     val_split = 0.2                 # Доля данных, выделяемая под валидацию
     factor_lr = 0.5                 # Коэффициент уменьшения learning rate при plateau
-    patience_lr = 1                 # Количество эпох без улучшения для снижения learning rate
+    patience_lr = 0                 # Количество эпох без улучшения для снижения learning rate
 
 config = Config()
 
@@ -230,7 +231,14 @@ class ImageDataset(Dataset):
         ])
 
 # ====================== ОБУЧЕНИЕ ======================
-def focal_loss_with_smoothing(outputs, targets, gamma=5.0, smoothing=0.1):
+def get_class_weights(dataset):
+    from collections import Counter
+    counts = Counter(label for _, label in dataset)
+    total = sum(counts.values())
+    weights = [total / counts[i] for i in range(len(counts))]
+    return torch.tensor(weights, dtype=torch.float32)
+    
+def focal_loss_with_smoothing(outputs, targets, gamma=5.0, smoothing=0.1, class_weights=None):
     num_classes = outputs.size(1)
     confidence = 1.0 - smoothing
 
@@ -245,8 +253,12 @@ def focal_loss_with_smoothing(outputs, targets, gamma=5.0, smoothing=0.1):
     focal_factor = (1 - pt).pow(gamma)
 
     loss = -torch.sum(true_dist * log_probs, dim=-1)
-    return torch.mean(focal_factor * loss)
 
+    weights = class_weights[targets]  # [B]
+    loss = loss * weights
+
+    return torch.mean(focal_factor * loss)
+    
 def compile_model(model):
     torch.compile(model, 
         mode="max-autotune", 
@@ -288,6 +300,7 @@ def run_training():
 
     train_size = int((1 - config.val_split) * len(full_dataset))
     train_ds, val_ds = torch.utils.data.random_split(full_dataset, [train_size, len(full_dataset) - train_size])
+    class_weights = get_class_weights(train_ds).to(device)
 
     train_loader = DataLoader(
         train_ds, 
@@ -438,7 +451,7 @@ def run_training():
             
             with torch.amp.autocast('cuda', enabled=config.mixed_precision):
                 outputs = model(inputs)
-                loss = focal_loss_with_smoothing(outputs, labels, config.focal_gamma, config.smoothing) / config.accumulation_steps
+                loss = focal_loss_with_smoothing(outputs, labels, config.focal_gamma, config.smoothing, class_weights) / config.accumulation_steps
             
             # Накопление градиентов (основное изменение)
             scaler.scale(loss).backward()
@@ -505,7 +518,7 @@ def run_training():
                 inputs, labels = inputs.to(device), labels.to(device)
                 outputs = model(inputs)
                 
-                loss = focal_loss_with_smoothing(outputs, labels, config.focal_gamma, config.smoothing) 
+                loss = focal_loss_with_smoothing(outputs, labels, config.focal_gamma, config.smoothing, class_weights)
                 val_loss += loss.item()
                 
                 _, predicted = torch.max(outputs, 1)
@@ -529,23 +542,26 @@ def run_training():
         
         print() 
 
+        current_lr = optimizer.param_groups[0]['lr']
         # Уменьшение скорости обучения      
         plateau_scheduler.step(val_loss)
+        next_lr = optimizer.param_groups[0]['lr']
 
         # Расчет метрик
         val_accuracy = 100 * val_correct / val_total
         val_precision = precision_score(all_labels, all_preds, average='macro', zero_division=0)
         val_recall = recall_score(all_labels, all_preds, average='macro', zero_division=0)
         val_f1 = f1_score(all_labels, all_preds, average='macro', zero_division=0)
+        delta = val_loss - best_loss
 
         # Логирование
         print(f"[Summary] Train Loss: {train_loss/len(train_loader):.4f} | Acc: {train_accuracy:.2f}%")
         print(f"[Summary] Val   Loss: {val_loss/len(val_loader):.4f} | Acc: {val_accuracy:.2f}%")
         print(f"[Summary] Val Precision: {val_precision:.4f} | Recall: {val_recall:.4f} | F1: {val_f1:.4f}")
         print(f"[Time] Epoch: {epoch_duration_str} | Total: {total_elapsed_str}")
-        current_lr = optimizer.param_groups[0]['lr']
-        print(f"[Summary] LR: {current_lr:.10f}")
-        print()
+        print(f"[Debug] Δ val_loss: {delta:.6f}")
+        print(f"[Summary] Current LR: {current_lr:.10f}")
+        print(f"[Summary] Next LR: {next_lr:.10f}")
 
         # Ранняя остановка
         if val_loss < best_loss:
@@ -560,11 +576,14 @@ def run_training():
                 'best_loss': best_loss,
                 'early_stop_counter': early_stop_counter,
             }, config.checkpoint_path)
+            print("[System] Save checkpoint")
         else:
             early_stop_counter += 1
             if early_stop_counter >= config.early_stopping_patience:
                 print("Ранняя остановка!")
                 break
+
+        print()
 
 # ====================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ======================
 def convert_to_onnx():
