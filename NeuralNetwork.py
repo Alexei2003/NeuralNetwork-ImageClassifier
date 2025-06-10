@@ -530,22 +530,26 @@ def run_training():
         
         print() 
 
+        current_lr = optimizer.param_groups[0]['lr']
         # Уменьшение скорости обучения      
         plateau_scheduler.step(val_loss)
+        next_lr = optimizer.param_groups[0]['lr']
 
         # Расчет метрик
         val_accuracy = 100 * val_correct / val_total
         val_precision = precision_score(all_labels, all_preds, average='macro', zero_division=0)
         val_recall = recall_score(all_labels, all_preds, average='macro', zero_division=0)
         val_f1 = f1_score(all_labels, all_preds, average='macro', zero_division=0)
+        delta = val_loss - best_loss
 
         # Логирование
         print(f"[Summary] Train Loss: {train_loss/len(train_loader):.4f} | Acc: {train_accuracy:.2f}%")
         print(f"[Summary] Val   Loss: {val_loss/len(val_loader):.4f} | Acc: {val_accuracy:.2f}%")
         print(f"[Summary] Val Precision: {val_precision:.4f} | Recall: {val_recall:.4f} | F1: {val_f1:.4f}")
         print(f"[Time] Epoch: {epoch_duration_str} | Total: {total_elapsed_str}")
-        current_lr = optimizer.param_groups[0]['lr']
+        print(f"[Debug] Δ val_loss: {delta:.6f}")
         print(f"[Summary] LR: {current_lr:.10f}")
+        print(f"[Summary] Next LR: {next_lr:.10f}")
         print()
 
         # Ранняя остановка
