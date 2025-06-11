@@ -14,14 +14,27 @@ from torchinfo import summary
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 import torch.backends.cudnn
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
 
 # ====================== КОНФИГУРАЦИЯ ======================
 class Config:
+    # выбор системы
+    system = "my"
+
+    match system:
+        case "my":
+            notebook = False
+            dir = "/media/alex/Programs/"
+        case "colab":
+            notebook = True
+            dir = "/content/"
+
     # Пути к данным и моделям
-    source_dir = "/media/alex/Programs/NeuralNetwork/DataSet/ARTS/Original"         # Папка с исходными изображениями
-    checkpoint_path = "/media/alex/Programs/NeuralNetwork/Model/best_model.pth"     # Путь для сохранения/загрузки модели
-    labels_path = "/media/alex/Programs/NeuralNetwork/Model/labels.txt"             # Файл с метками классов
-    onnx_path = "/media/alex/Programs/NeuralNetwork/Model/model.onnx"               # Путь для экспортированной модели в ONNX формате
+    source_dir = dir + "NeuralNetwork/DataSet/ARTS/Original"         # Папка с исходными изображениями
+    checkpoint_path = dir + "NeuralNetwork/Model/best_model.pth"     # Путь для сохранения/загрузки модели
+    labels_path = dir + "NeuralNetwork/Model/labels.txt"             # Файл с метками классов
+    onnx_path = dir + "NeuralNetwork/Model/model.onnx"               # Путь для экспортированной модели в ONNX формате
 
     # Флаги управления обучением
     resume_training = False         # Продолжать обучение с сохраненного чекпоинта, если True
@@ -38,10 +51,10 @@ class Config:
 
     # Параметры обучения
     accumulation_steps = 5          # Количество шагов накопления градиентов (для эффективного увеличения размера батча без увеличения памяти)
-    lr = 0.004 * accumulation_steps # Начальная скорость обучения (learning rate), масштабируется под accumulation_steps для стабильности
+    lr = 0.005 * accumulation_steps # Начальная скорость обучения (learning rate), масштабируется под accumulation_steps для стабильности
     batch_size = 100                # Размер батча (число примеров, обрабатываемых за один проход)
     epochs = 100                    # Количество эпох обучения (полных проходов по всему датасету)
-    focal_gamma = 5                 # Параметр гамма для Focal Loss, регулирует степень фокусировки на сложных примерах
+    focal_gamma = 3                 # Параметр гамма для Focal Loss, регулирует степень фокусировки на сложных примерах
     smoothing = 0.1                 # Параметр label smoothing, задаёт уровень сглаживания меток для улучшения обобщения
     threshold = 1e-2                # Разница val loss для уменьшения learning rate
 
@@ -50,7 +63,7 @@ class Config:
     early_stopping_patience = 5     # Количество эпох без улучшения для ранней остановки
     val_split = 0.2                 # Доля данных, выделяемая под валидацию
     factor_lr = 0.5                 # Коэффициент уменьшения learning rate при plateau
-    patience_lr = 1                 # Количество эпох без улучшения для снижения learning rate
+    patience_lr = 0                 # Количество эпох без улучшения для снижения learning rate
 
 config = Config()
 
@@ -147,7 +160,7 @@ class AnimeClassifier(nn.Module):
         self.backbone = nn.Sequential(
             nn.Conv2d(3, 64, 7, stride=2, padding=3, bias=False),
             nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True) ,
+            nn.ReLU(inplace=True),
             nn.MaxPool2d(3, stride=2, padding=1),
             ResidualBlock(64, 64),
             ResidualBlock(64, 128, stride=2),
@@ -156,16 +169,17 @@ class AnimeClassifier(nn.Module):
             nn.AdaptiveAvgPool2d(1)
         )
         self.moe = MoE(512, config.num_experts, config.expert_units, config.k_top_expert)
-        self.head = nn.Sequential(
+        self.classifier = nn.Sequential(
+            nn.Linear(512, 512),
+            nn.ReLU(inplace=True),
             nn.Dropout(config.dropout),
             nn.Linear(512, num_classes)
-
         )
 
-    def forward(self, x):
+    def forward(self, x): 
         x = self.backbone(x).flatten(1)
         x = self.moe(x)
-        return self.head(x)
+        return self.classifier(x) 
 
 # ====================== ОБРАБОТКА ДАННЫХ ======================
 class ImageDataset(Dataset):
@@ -231,22 +245,112 @@ class ImageDataset(Dataset):
         ])
 
 # ====================== ОБУЧЕНИЕ ======================
-def focal_loss_with_smoothing(outputs, targets, gamma=5.0, smoothing=0.1):
+def mixup_data(x, y, alpha=1.0):
+    if alpha > 0:
+        lam = np.random.beta(alpha, alpha)
+    else:
+        lam = 1
+    batch_size = x.size(0)
+    index = torch.randperm(batch_size).to(x.device)
+
+    mixed_x = lam * x + (1 - lam) * x[index, :]
+    y_a, y_b = y, y[index]
+    return mixed_x, y_a, y_b, lam
+
+def cutmix_data(x, y, alpha=1.0):
+    if alpha > 0:
+        lam = np.random.beta(alpha, alpha)
+    else:
+        lam = 1
+    batch_size, _, h, w = x.size()
+    index = torch.randperm(batch_size).to(x.device)
+
+    cx = np.random.randint(w)
+    cy = np.random.randint(h)
+    cut_w = int(w * np.sqrt(1 - lam))
+    cut_h = int(h * np.sqrt(1 - lam))
+
+    x1 = np.clip(cx - cut_w // 2, 0, w)
+    x2 = np.clip(cx + cut_w // 2, 0, w)
+    y1 = np.clip(cy - cut_h // 2, 0, h)
+    y2 = np.clip(cy + cut_h // 2, 0, h)
+
+    x[:, :, y1:y2, x1:x2] = x[index, :, y1:y2, x1:x2]
+    y_a, y_b = y, y[index]
+    lam = 1 - ((x2 - x1) * (y2 - y1) / (w * h))
+    return x, y_a, y_b, lam
+
+def get_class_weights_from_dirs(root_dir, class_names):
+    class_counts = []
+    for class_name in class_names:
+        path = os.path.join(root_dir, class_name)
+        count = len(glob(os.path.join(path, "*")))
+        class_counts.append(count)
+
+    total = sum(class_counts)
+    weights = [total / (count + 1e-6) for count in class_counts]  # защита от деления на 0
+    weights = torch.tensor(weights)
+    weights = weights / weights.max()  # нормализация
+    return weights
+
+def focal_loss_with_smoothing(outputs, targets, gamma=5.0, smoothing=0.1, class_weights=None):
     num_classes = outputs.size(1)
     confidence = 1.0 - smoothing
 
     log_probs = torch.nn.functional.log_softmax(outputs, dim=-1)
     probs = torch.exp(log_probs)
 
-    # Сглаженные one-hot метки
     true_dist = torch.full_like(log_probs, smoothing / (num_classes - 1))
     true_dist.scatter_(1, targets.unsqueeze(1), confidence)
 
     pt = torch.sum(true_dist * probs, dim=-1)
     focal_factor = (1 - pt).pow(gamma)
-
     loss = -torch.sum(true_dist * log_probs, dim=-1)
+
+    if class_weights is not None:
+        weights = class_weights[targets]
+        loss = loss * weights
+
     return torch.mean(focal_factor * loss)
+
+def imshow(img_tensor, title=None):
+    # img_tensor: Tensor с форматом (C, H, W)
+    # Преобразуем тензор в numpy для matplotlib и нормализуем к [0,1]
+    img = img_tensor.cpu().numpy()
+    img = np.transpose(img, (1, 2, 0))  # C,H,W -> H,W,C
+    img = np.clip(img, 0, 1)  # Чтобы избежать проблем с цветами
+
+    plt.imshow(img)
+    if title:
+        plt.title(title)
+    plt.axis('off')
+    plt.savefig('output_image.png')
+    plt.close()
+
+def forward_with_mixup_cutmix(model, inputs, labels, config, class_weights, device):
+    inputs, labels = inputs.to(device), labels.to(device)
+
+    use_mix = np.random.rand() < 0.20
+    use_cutmix = np.random.rand() < 0.5
+
+    if use_mix:
+        if use_cutmix:
+            inputs, targets_a, targets_b, lam = cutmix_data(inputs, labels, alpha=1.0)
+        else:
+            inputs, targets_a, targets_b, lam = mixup_data(inputs, labels, alpha=1.0)
+
+        #imshow(inputs[1], title="Original image")
+
+        with torch.amp.autocast('cuda', enabled=config.mixed_precision):
+            outputs = model(inputs)
+            loss = lam * focal_loss_with_smoothing(outputs, targets_a, config.focal_gamma, config.smoothing, class_weights) / config.accumulation_steps \
+                 + (1 - lam) * focal_loss_with_smoothing(outputs, targets_b, config.focal_gamma, config.smoothing, class_weights) / config.accumulation_steps
+    else:
+        with torch.amp.autocast('cuda', enabled=config.mixed_precision):
+            outputs = model(inputs)
+            loss = focal_loss_with_smoothing(outputs, labels, config.focal_gamma, config.smoothing, class_weights) / config.accumulation_steps
+
+    return outputs, loss
 
 def compile_model(model):
     torch.compile(model, 
@@ -290,23 +394,36 @@ def run_training():
     train_size = int((1 - config.val_split) * len(full_dataset))
     train_ds, val_ds = torch.utils.data.random_split(full_dataset, [train_size, len(full_dataset) - train_size])
 
-    train_loader = DataLoader(
-        train_ds, 
-        batch_size=config.batch_size, 
-        shuffle=True, 
-        num_workers=os.cpu_count(), 
-        persistent_workers=True,            
-        prefetch_factor=2, 
-        pin_memory=True)
-    val_loader = DataLoader(
-        val_ds, 
-        batch_size=config.batch_size, 
-        num_workers=os.cpu_count(), 
-        persistent_workers=True, 
-        prefetch_factor=2, 
-        pin_memory=True)
+    if(config.notebook):
+        train_loader = DataLoader(
+            train_ds, 
+            batch_size=config.batch_size, 
+            shuffle=True, 
+            pin_memory=True)
+        val_loader = DataLoader(
+            val_ds, 
+            batch_size=config.batch_size, 
+            pin_memory=True)
+    else :
+        train_loader = DataLoader(
+            train_ds, 
+            batch_size=config.batch_size, 
+            shuffle=True, 
+            num_workers=os.cpu_count(), 
+            persistent_workers=True,            
+            prefetch_factor=2, 
+            pin_memory=True)
+        val_loader = DataLoader(
+            val_ds, 
+            batch_size=config.batch_size, 
+            num_workers=os.cpu_count(), 
+            persistent_workers=True, 
+            prefetch_factor=2, 
+            pin_memory=True)
 
     model = AnimeClassifier(len(full_classes)).to(device)
+
+    class_weights = get_class_weights_from_dirs(config.source_dir, full_classes).to(device)
 
     optimizer = optim.AdamW(model.parameters(), lr=config.lr)
     plateau_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -423,7 +540,6 @@ def run_training():
     summary(model, input_size=(1, 3, 224, 224))
 
     start_time = time.time()  # Засекаем время начала
-
     optimizer.zero_grad(set_to_none=True)  # Инициализация градиентов
     for epoch in range(start_epoch, config.epochs):
         model.train()
@@ -437,9 +553,8 @@ def run_training():
             batch_start_time = time.time()  # Время начала обработки батча
             inputs, labels = inputs.to(device), labels.to(device)
             
-            with torch.amp.autocast('cuda', enabled=config.mixed_precision):
-                outputs = model(inputs)
-                loss = focal_loss_with_smoothing(outputs, labels, config.focal_gamma, config.smoothing) / config.accumulation_steps
+            outputs, loss = forward_with_mixup_cutmix(model, inputs, labels, config, class_weights, device)
+            loss / config.accumulation_steps
             
             # Накопление градиентов (основное изменение)
             scaler.scale(loss).backward()
