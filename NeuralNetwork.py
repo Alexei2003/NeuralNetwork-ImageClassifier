@@ -330,7 +330,7 @@ def imshow(img_tensor, title=None):
 def forward_with_mixup_cutmix(model, inputs, labels, config, class_weights, device):
     inputs, labels = inputs.to(device), labels.to(device)
 
-    use_mix = np.random.rand() < 0.20
+    use_mix = np.random.rand() < 0.50
     use_cutmix = np.random.rand() < 0.5
 
     if use_mix:
