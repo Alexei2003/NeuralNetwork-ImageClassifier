@@ -51,10 +51,10 @@ class Config:
 
     # Параметры обучения
     accumulation_steps = 5          # Количество шагов накопления градиентов (для эффективного увеличения размера батча без увеличения памяти)
-    lr = 0.005 * accumulation_steps # Начальная скорость обучения (learning rate), масштабируется под accumulation_steps для стабильности
+    lr = 0.002 * accumulation_steps # Начальная скорость обучения (learning rate), масштабируется под accumulation_steps для стабильности
     batch_size = 100                # Размер батча (число примеров, обрабатываемых за один проход)
     epochs = 100                    # Количество эпох обучения (полных проходов по всему датасету)
-    focal_gamma = 3                 # Параметр гамма для Focal Loss, регулирует степень фокусировки на сложных примерах
+    focal_gamma = 5                 # Параметр гамма для Focal Loss, регулирует степень фокусировки на сложных примерах
     smoothing = 0.1                 # Параметр label smoothing, задаёт уровень сглаживания меток для улучшения обобщения
     threshold = 1e-2                # Разница val loss для уменьшения learning rate
 
@@ -87,28 +87,28 @@ class MoE(nn.Module):
         logits = self.router(x)
         top_k_weights, top_k_indices = logits.topk(self.k_top, dim=1)
         top_k_weights = torch.softmax(top_k_weights, dim=1)
-        
+
         # Создаем тензор всех экспертных выходов
         expert_outputs = torch.stack([expert(x) for expert in self.experts], dim=1)  # [B, num_experts, D]
-        
+
         # Создаем маску для выбранных экспертов [B, num_experts, D]
         mask = torch.zeros_like(expert_outputs)
         mask = torch.scatter(
-            mask, 
-            1, 
+            mask,
+            1,
             top_k_indices.unsqueeze(-1).expand(-1, -1, expert_outputs.size(-1)),
             1.0
         )
-        
+
         # Объединяем градиенты только для выбранных экспертов
         expert_outputs = expert_outputs * mask + (expert_outputs * (1 - mask)).detach()
-        
+
         # Выбираем топ-k экспертов
         selected_outputs = expert_outputs.gather(
-            1, 
+            1,
             top_k_indices.unsqueeze(-1).expand(-1, -1, expert_outputs.size(-1))
         )
-        
+
         # Взвешенное суммирование
         output = (selected_outputs * top_k_weights.unsqueeze(-1)).sum(dim=1)
         return output + x
@@ -136,7 +136,7 @@ class ResidualBlock(nn.Module):
         self.conv2 = nn.Conv2d(out_channels, out_channels, 3, padding=1, bias=False)
         self.bn2 = nn.BatchNorm2d(out_channels)
         self.se = SEBlock(out_channels)
-        self.act = nn.ReLU(inplace=True) 
+        self.act = nn.ReLU(inplace=True)
         self.dropout = nn.Dropout2d(config.dropout)  # Добавлен Dropout
 
         self.shortcut = nn.Sequential()
@@ -146,7 +146,7 @@ class ResidualBlock(nn.Module):
                 nn.BatchNorm2d(out_channels)
             )
 
-    def forward(self, x):      
+    def forward(self, x):
         residual = self.shortcut(x)
         x = self.act(self.bn1(self.conv1(x)))
         x = self.dropout(x)  # Добавлен Dropout
@@ -176,10 +176,10 @@ class AnimeClassifier(nn.Module):
             nn.Linear(512, num_classes)
         )
 
-    def forward(self, x): 
+    def forward(self, x):
         x = self.backbone(x).flatten(1)
         x = self.moe(x)
-        return self.classifier(x) 
+        return self.classifier(x)
 
 # ====================== ОБРАБОТКА ДАННЫХ ======================
 class ImageDataset(Dataset):
@@ -189,25 +189,25 @@ class ImageDataset(Dataset):
                 self.classes = [line.strip() for line in f]
         else:
             self.classes = sorted(os.listdir(root))
-        
+
         self.samples = []
         for label, cls in enumerate(self.classes):
             cls_path = os.path.join(root, cls)
             self.samples.extend([(f, label) for f in glob(os.path.join(cls_path, '*'))])
-        
+
         self.transform = transform or self._get_transforms(mode)
 
-    def __len__(self): 
+    def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
         img_path, label = self.samples[idx]
         img = np.array(Image.open(img_path).convert('RGB'))  # Конвертация в numpy array
-        
+
         if self.transform:
             augmented = self.transform(image=img)
             img = augmented['image']
-            
+
         return img, label
 
     @staticmethod
@@ -290,7 +290,7 @@ def get_class_weights_from_dirs(root_dir, class_names):
     total = sum(class_counts)
     weights = [total / (count + 1e-6) for count in class_counts]  # защита от деления на 0
     weights = torch.tensor(weights)
-    weights = weights / weights.max()  # нормализация
+    weights = weights / weights.mean()  # нормализация
     return weights
 
 def focal_loss_with_smoothing(outputs, targets, gamma=5.0, smoothing=0.1, class_weights=None):
@@ -353,11 +353,11 @@ def forward_with_mixup_cutmix(model, inputs, labels, config, class_weights, devi
     return outputs, loss
 
 def compile_model(model):
-    torch.compile(model, 
-        mode="max-autotune", 
-        dynamic=False, 
+    torch.compile(model,
+        mode="max-autotune",
+        dynamic=False,
         fullgraph=False)
-    torch.cuda.empty_cache()  
+    torch.cuda.empty_cache()
 
 def run_training():
     # Оптимизация матричных операций (НОВОЕ)
@@ -394,32 +394,21 @@ def run_training():
     train_size = int((1 - config.val_split) * len(full_dataset))
     train_ds, val_ds = torch.utils.data.random_split(full_dataset, [train_size, len(full_dataset) - train_size])
 
-    if(config.notebook):
-        train_loader = DataLoader(
-            train_ds, 
-            batch_size=config.batch_size, 
-            shuffle=True, 
-            pin_memory=True)
-        val_loader = DataLoader(
-            val_ds, 
-            batch_size=config.batch_size, 
-            pin_memory=True)
-    else :
-        train_loader = DataLoader(
-            train_ds, 
-            batch_size=config.batch_size, 
-            shuffle=True, 
-            num_workers=os.cpu_count(), 
-            persistent_workers=True,            
-            prefetch_factor=2, 
-            pin_memory=True)
-        val_loader = DataLoader(
-            val_ds, 
-            batch_size=config.batch_size, 
-            num_workers=os.cpu_count(), 
-            persistent_workers=True, 
-            prefetch_factor=2, 
-            pin_memory=True)
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=config.batch_size,
+        shuffle=True,
+        num_workers=os.cpu_count(),
+        persistent_workers=True,
+        prefetch_factor=2,
+        pin_memory=True)
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=config.batch_size,
+        num_workers=os.cpu_count(),
+        persistent_workers=True,
+        prefetch_factor=2,
+        pin_memory=True)
 
     model = AnimeClassifier(len(full_classes)).to(device)
 
@@ -442,28 +431,28 @@ def run_training():
 
     if config.resume_training:
         checkpoint = torch.load(config.checkpoint_path)
-        
+
         # Удаление префикса _orig_mod. из ключей (если есть)
         checkpoint['model_state_dict'] = {
-            k.replace("_orig_mod.", ""): v 
+            k.replace("_orig_mod.", ""): v
             for k, v in checkpoint['model_state_dict'].items()
         }
-        
+
         # Поиск ключа для весов head слоя
         head_weight_key = next(
-            (k for k in checkpoint['model_state_dict'] 
-            if 'head' in k and 'weight' in k and k.endswith('.weight')), 
+            (k for k in checkpoint['model_state_dict']
+            if 'head' in k and 'weight' in k and k.endswith('.weight')),
             None
         )
         if not head_weight_key:
             raise KeyError("❌ Ключ для весов head слоя не найден в чекпоинте!")
-        
+
         saved_num_classes = checkpoint['model_state_dict'][head_weight_key].shape[0]
         current_num_classes = len(full_dataset.classes)
 
         # Частичная загрузка весов (игнорируем head слой)
         model.load_state_dict(
-            {k: v for k, v in checkpoint['model_state_dict'].items() 
+            {k: v for k, v in checkpoint['model_state_dict'].items()
             if not ('head' in k and ('weight' in k or 'bias' in k))},
             strict=False
         )
@@ -471,7 +460,7 @@ def run_training():
         # Инициализация новых весов
         if current_num_classes > saved_num_classes:
             print(f"🆕 Добавлено {current_num_classes - saved_num_classes} новых классов")
-            
+
             # Инициализация новых весов
             nn.init.kaiming_normal_(
                 model.head[1].weight.data[saved_num_classes:],
@@ -479,27 +468,27 @@ def run_training():
                 nonlinearity='linear'
             )
             nn.init.constant_(
-                model.head[1].bias.data[saved_num_classes:], 
+                model.head[1].bias.data[saved_num_classes:],
                 0.0
             )
 
             # Пересоздаем оптимизатор с новыми параметрами
             optimizer = optim.AdamW(model.parameters(), lr=config.lr)
-            
+
             # Загружаем состояние старого оптимизатора
             old_optimizer_state = checkpoint['optimizer_state_dict']
-            
+
             # Создаем совместимое состояние
             new_optimizer_state = {
                 'state': {},  # Инициализируем состояния с нуля
                 'param_groups': old_optimizer_state['param_groups']  # Сохраняем настройки групп
             }
-            
+
             # Загружаем состояние для совместимых параметров
             for param_name, param_state in old_optimizer_state['state'].items():
                 if param_name in optimizer.state_dict()['state']:
                     new_optimizer_state['state'][param_name] = param_state
-            
+
             optimizer.load_state_dict(new_optimizer_state)
 
             # Компиляция модели
@@ -510,7 +499,7 @@ def run_training():
             best_loss = checkpoint['best_loss']
             early_stop_counter = checkpoint['early_stop_counter']
 
-            print(f"🔄 Старт дообучения, новых классов: {current_num_classes - saved_num_classes}")     
+            print(f"🔄 Старт дообучения, новых классов: {current_num_classes - saved_num_classes}")
         else:
             # Оптимизация модели
             compile_model(model)
@@ -531,7 +520,7 @@ def run_training():
             'epoch': -1,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
-            'scheduler_plateau': plateau_scheduler.state_dict(), 
+            'scheduler_plateau': plateau_scheduler.state_dict(),
             'scaler_state_dict': scaler.state_dict(),
             'best_loss': best_loss,
             'early_stop_counter': early_stop_counter,
@@ -545,45 +534,45 @@ def run_training():
         model.train()
         train_loss = 0.0
         train_correct, train_total = 0, 0
-        optimizer.zero_grad() 
+        optimizer.zero_grad()
         accumulated_loss = 0.0  # Для агрегации потерь при накоплении
 
         epoch_start_time = time.time()  # Время начала эпохи
         for batch_idx, (inputs, labels) in enumerate(train_loader):
             batch_start_time = time.time()  # Время начала обработки батча
             inputs, labels = inputs.to(device), labels.to(device)
-            
+
             outputs, loss = forward_with_mixup_cutmix(model, inputs, labels, config, class_weights, device)
             loss / config.accumulation_steps
-            
+
             # Накопление градиентов (основное изменение)
             scaler.scale(loss).backward()
             accumulated_loss += loss.item() * config.accumulation_steps
-            
+
             # Обновление только на последнем шаге накопления
             if (batch_idx + 1) % config.accumulation_steps == 0 or (batch_idx + 1) == len(train_loader):
                 # Градиентный клиппинг
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                
+
                 # Шаг оптимизатора
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
-                
+
                 # Расчет метрик только при обновлении
                 _, predicted = torch.max(outputs, 1)
                 current_batch_size = labels.size(0)
                 train_total += current_batch_size
                 train_correct += (predicted == labels).sum().item()
-                
+
                 # Логирование только при обновлении
                 batch_loss_value = accumulated_loss
                 train_loss += batch_loss_value
-                
+
                 # Сброс накопленных потерь
                 accumulated_loss = 0.0
-                
+
                 # Расчет времени для логирования
                 batch_end_time = time.time()
                 batch_duration = batch_end_time - batch_start_time
@@ -611,19 +600,19 @@ def run_training():
         model.eval()
         val_loss, val_correct, val_total = 0.0, 0, 0
         all_preds, all_labels = [], []
-        
+
         val_loader_len = len(val_loader)
 
         with torch.inference_mode(), torch.amp.autocast('cuda', enabled=config.mixed_precision):
             for batch_idx, (inputs, labels) in enumerate(val_loader):
                 batch_start_time = time.time()
-                
+
                 inputs, labels = inputs.to(device), labels.to(device)
                 outputs = model(inputs)
-                
-                loss = focal_loss_with_smoothing(outputs, labels, config.focal_gamma, config.smoothing) 
+
+                loss = focal_loss_with_smoothing(outputs, labels, config.focal_gamma, config.smoothing)
                 val_loss += loss.item()
-                
+
                 _, predicted = torch.max(outputs, 1)
                 val_total += labels.size(0)
                 val_correct += (predicted == labels).sum().item()
@@ -642,11 +631,11 @@ def run_training():
                     f"\r[Val]   Epoch {epoch+1}/{config.epochs} | Batch {batch_idx+1}/{val_loader_len} | "
                     f"Loss: {loss.item():.4f} | Remaining: {remaining_time_str}",
                     end='', flush=True)
-        
-        print() 
+
+        print()
 
         current_lr = optimizer.param_groups[0]['lr']
-        # Уменьшение скорости обучения      
+        # Уменьшение скорости обучения
         plateau_scheduler.step(val_loss)
         next_lr = optimizer.param_groups[0]['lr']
 
@@ -675,7 +664,7 @@ def run_training():
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_plateau': plateau_scheduler.state_dict(), 
+                'scheduler_plateau': plateau_scheduler.state_dict(),
                 'scaler_state_dict': scaler.state_dict(),
                 'best_loss': best_loss,
                 'early_stop_counter': early_stop_counter,
@@ -691,25 +680,25 @@ def convert_to_onnx():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = AnimeClassifier(len(get_classes())).to(device)
     checkpoint = torch.load(config.checkpoint_path)
-    
+
     # Извлекаем веса модели из чекпоинта
     model_state_dict = checkpoint['model_state_dict']
-    
+
     # Удаляем префикс _orig_mod. из ключей (если есть)
     model_state_dict = {
-        k.replace("_orig_mod.", ""): v 
+        k.replace("_orig_mod.", ""): v
         for k, v in model_state_dict.items()
     }
-    
+
     # Загружаем веса
     model.load_state_dict(model_state_dict)
     model.eval()
-    
+
     # Экспорт в ONNX
     dummy_input = torch.randn(1, 3, *config.input_size).to(device)
     torch.onnx.export(
-        model, 
-        dummy_input, 
+        model,
+        dummy_input,
         config.onnx_path,
         input_names=['input'],
         output_names=['output'],
@@ -725,10 +714,10 @@ def test_onnx():
     if not os.path.exists(config.onnx_path):
         print("ONNX модель не найдена!")
         return
-    
+
     # Загрузка ONNX-модели
     session = ort.InferenceSession(config.onnx_path)
-    
+
     try:
         img = Image.open("test.jpg").convert('RGB')
         img_np = np.array(img)
@@ -736,26 +725,26 @@ def test_onnx():
         # Применение преобразований
         transform = ImageDataset._get_transforms('val')
         augmented = transform(image=img_np)
-        img_tensor = augmented['image'].unsqueeze(0)  
+        img_tensor = augmented['image'].unsqueeze(0)
     except FileNotFoundError:
         print("Файл test.jpg не найден!")
         return
 
     # ====================== PyTorch предсказание ======================
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
+
     # Инициализация и загрузка PyTorch-модели
     model = AnimeClassifier(len(get_classes())).to(device)
     checkpoint = torch.load(config.checkpoint_path)
-    
+
     # Удаление префиксов _orig_mod. (если есть)
     model_state_dict = {
-        k.replace("_orig_mod.", ""): v 
+        k.replace("_orig_mod.", ""): v
         for k, v in checkpoint['model_state_dict'].items()
     }
     model.load_state_dict(model_state_dict)
     model.eval()
-    
+
     # Предсказание PyTorch
     with torch.no_grad():
         pytorch_output = model(img_tensor.to(device))
@@ -801,7 +790,7 @@ def main_menu():
         print("4. Протестировать ONNX")
         print("0. Выход")
         choice = input("Выбор: ").strip()
-        
+
         if choice == '1':
             config.resume_training = False
             run_training()
