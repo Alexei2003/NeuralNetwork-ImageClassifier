@@ -51,7 +51,7 @@ class Config:
 
     # Параметры обучения
     accumulation_steps = 16         # Количество шагов накопления градиентов (для эффективного увеличения размера батча без увеличения памяти)
-    lr = 0.0002*accumulation_steps  # Начальная скорость обучения (learning rate), масштабируется под accumulation_steps для стабильности
+    lr = 0.0002                     # Начальная скорость обучения (learning rate), масштабируется под accumulation_steps для стабильности
     batch_size = 64                 # Размер батча (число примеров, обрабатываемых за один проход)
     epochs = 100                    # Количество эпох обучения (полных проходов по всему датасету)
     focal_gamma = 5                 # Параметр гамма для Focal Loss, регулирует степень фокусировки на сложных примерах
@@ -438,39 +438,43 @@ def run_training():
             for k, v in checkpoint['model_state_dict'].items()
         }
 
-        # Поиск ключа для весов head слоя
-        head_weight_key = next(
-            (k for k in checkpoint['model_state_dict']
-            if 'head' in k and 'weight' in k and k.endswith('.weight')),
-            None
-        )
-        if not head_weight_key:
-            raise KeyError("❌ Ключ для весов head слоя не найден в чекпоинте!")
-
-        saved_num_classes = checkpoint['model_state_dict'][head_weight_key].shape[0]
+        # Получаем все ключи классификатора, содержащие '.weight'
+        classifier_keys = [k for k in checkpoint['model_state_dict'] if k.startswith('classifier') and '.weight' in k]
+        # Выбираем тот, что с максимальным индексом (например, 'classifier.3.weight')
+        classifier_weight_key = sorted(classifier_keys, key=lambda k: int(k.split('.')[1]))[-1]
+        if not classifier_weight_key:
+            raise KeyError("❌ Ключ для весов classifier слоя не найден в чекпоинте!")
+        # Получаем количество сохранённых классов
+        saved_num_classes = checkpoint['model_state_dict'][classifier_weight_key].shape[0]
         current_num_classes = len(full_dataset.classes)
 
-        # Частичная загрузка весов (игнорируем head слой)
+        # Частичная загрузка весов (игнорируем classifier слой)
         model.load_state_dict(
             {k: v for k, v in checkpoint['model_state_dict'].items()
-            if not ('head' in k and ('weight' in k or 'bias' in k))},
+            if not ('classifier.3' in k and ('weight' in k or 'bias' in k))},
             strict=False
         )
 
+        # Восстановление старых весов classifier слоя
+        with torch.no_grad():
+            model.classifier[3].weight.data[:saved_num_classes] = checkpoint['model_state_dict']['classifier.3.weight'][:saved_num_classes]
+            model.classifier[3].bias.data[:saved_num_classes] = checkpoint['model_state_dict']['classifier.3.bias'][:saved_num_classes]
+
         # Инициализация новых весов
         if current_num_classes > saved_num_classes:
-            print(f"🆕 Добавлено {current_num_classes - saved_num_classes} новых классов")
-
             # Инициализация новых весов
-            nn.init.kaiming_normal_(
-                model.head[1].weight.data[saved_num_classes:],
-                mode='fan_out',
-                nonlinearity='linear'
-            )
-            nn.init.constant_(
-                model.head[1].bias.data[saved_num_classes:],
-                0.0
-            )
+            with torch.no_grad():
+                nn.init.kaiming_normal_(
+                    model.classifier[3].weight.data[saved_num_classes:],
+                    mode='fan_out',
+                    nonlinearity='linear'
+                )
+                nn.init.constant_(
+                    model.classifier[3].bias.data[saved_num_classes:],
+                    0.0
+                )
+
+            print(f"🆕 Добавлено {current_num_classes - saved_num_classes} новых классов")
 
             # Пересоздаем оптимизатор с новыми параметрами
             optimizer = optim.AdamW(model.parameters(), lr=config.lr)
@@ -543,8 +547,6 @@ def run_training():
             inputs, labels = inputs.to(device), labels.to(device)
 
             outputs, loss = forward_with_mixup_cutmix(model, inputs, labels, config, class_weights, device)
-            loss / config.accumulation_steps
-
             # Накопление градиентов (основное изменение)
             scaler.scale(loss).backward()
             accumulated_loss += loss.item() * config.accumulation_steps
@@ -578,15 +580,15 @@ def run_training():
                 batch_duration = batch_end_time - batch_start_time
                 remaining_batches = len(train_loader) - (batch_idx + 1)
                 estimated_remaining_time = remaining_batches * batch_duration
-                remaining_time_str = time.strftime('%H:%M:%S', time.gmtime(estimated_remaining_time))
-
-                print(
-                    f"\r[Train] Epoch {epoch+1}/{config.epochs} | Batch {batch_idx+1}/{len(train_loader)} | "
-                    f"Loss: {batch_loss_value:.4f} | Remaining time: {remaining_time_str}",
-                    end='', flush=True)
             else:
                 # Пропускаем логирование на промежуточных шагах
                 continue
+
+            remaining_time_str = time.strftime('%H:%M:%S', time.gmtime(estimated_remaining_time))
+            print(
+                f"\r[Train] Epoch {epoch+1}/{config.epochs} | Batch {batch_idx+1}/{len(train_loader)} | "
+                f"Loss: {(batch_loss_value / config.accumulation_steps):.4f} | Remaining time: {remaining_time_str}",
+                end='', flush=True)
 
         epoch_end_time = time.time()  # Время окончания эпохи
         epoch_duration = epoch_end_time - epoch_start_time
@@ -644,17 +646,14 @@ def run_training():
         val_precision = precision_score(all_labels, all_preds, average='macro', zero_division=0)
         val_recall = recall_score(all_labels, all_preds, average='macro', zero_division=0)
         val_f1 = f1_score(all_labels, all_preds, average='macro', zero_division=0)
-        delta = val_loss - best_loss
 
         # Логирование
         print(f"[Summary] Train Loss: {train_loss/len(train_loader):.4f} | Acc: {train_accuracy:.2f}%")
         print(f"[Summary] Val   Loss: {val_loss/len(val_loader):.4f} | Acc: {val_accuracy:.2f}%")
         print(f"[Summary] Val Precision: {val_precision:.4f} | Recall: {val_recall:.4f} | F1: {val_f1:.4f}")
-        print(f"[Time] Epoch: {epoch_duration_str} | Total: {total_elapsed_str}")
-        print(f"[Debug] Δ val_loss: {delta:.6f}")
+        print(f"[Time]    Epoch: {epoch_duration_str} | Total: {total_elapsed_str}")
         print(f"[Summary] LR: {current_lr:.10f}")
         print(f"[Summary] Next LR: {next_lr:.10f}")
-        print()
 
         # Ранняя остановка
         if val_loss < best_loss:
@@ -669,11 +668,13 @@ def run_training():
                 'best_loss': best_loss,
                 'early_stop_counter': early_stop_counter,
             }, config.checkpoint_path)
+            print("[System]  Save Checkpoint")
         else:
             early_stop_counter += 1
             if early_stop_counter >= config.early_stopping_patience:
-                print("Ранняя остановка!")
+                print("[System]  Early Stop")
                 break
+        print()
 
 # ====================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ======================
 def convert_to_onnx():
