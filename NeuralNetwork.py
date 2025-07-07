@@ -31,10 +31,10 @@ class Config:
             dir = "/content/"
 
     # Пути к данным и моделям
-    source_dir = dir + "NeuralNetwork/DataSet/ARTS/Original"         # Папка с исходными изображениями
-    checkpoint_path = dir + "NeuralNetwork/Model/best_model.pth"     # Путь для сохранения/загрузки модели
-    labels_path = dir + "NeuralNetwork/Model/labels.txt"             # Файл с метками классов
-    onnx_path = dir + "NeuralNetwork/Model/model.onnx"               # Путь для экспортированной модели в ONNX формате
+    source_dir = dir + "NEURAL_NETWORKS\NeuralNetwork-ImageClassifier/DataSet/ARTS/Original"         # Папка с исходными изображениями
+    checkpoint_path = dir + "NEURAL_NETWORKS\NeuralNetwork-ImageClassifier//Model/best_model.pth"     # Путь для сохранения/загрузки модели
+    labels_path = dir + "NEURAL_NETWORKS\NeuralNetwork-ImageClassifier//Model/labels.txt"             # Файл с метками классов
+    onnx_path = dir + "NEURAL_NETWORKS\NeuralNetwork-ImageClassifier//Model/model.onnx"               # Путь для экспортированной модели в ONNX формате
 
     # Флаги управления обучением
     resume_training = False         # Продолжать обучение с сохраненного чекпоинта, если True
