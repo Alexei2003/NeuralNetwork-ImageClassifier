@@ -1,4 +1,3 @@
-
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -20,7 +19,7 @@ import matplotlib.pyplot as plt
 # ====================== КОНФИГУРАЦИЯ ======================
 class Config:
     # выбор системы
-    system = "my"
+    system = "colab"
 
     match system:
         case "my":
@@ -54,7 +53,7 @@ class Config:
     lr = 0.0002                     # Начальная скорость обучения (learning rate), масштабируется под accumulation_steps для стабильности
     batch_size = 64                 # Размер батча (число примеров, обрабатываемых за один проход)
     epochs = 100                    # Количество эпох обучения (полных проходов по всему датасету)
-    focal_gamma = 5                 # Параметр гамма для Focal Loss, регулирует степень фокусировки на сложных примерах
+    focal_gamma = 2                 # Параметр гамма для Focal Loss, регулирует степень фокусировки на сложных примерах
     smoothing = 0.1                 # Параметр label smoothing, задаёт уровень сглаживания меток для улучшения обобщения
     threshold = 1e-2                # Разница val loss для уменьшения learning rate
 
