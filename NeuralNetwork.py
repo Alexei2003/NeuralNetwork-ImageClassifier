@@ -421,7 +421,6 @@ def run_training():
         patience=config.patience_lr,
         threshold=config.threshold, # ← игнорирует минимальные изменения
         threshold_mode='rel',       # ← относительное сравнение
-        verbose=True                # ← печатает сообщение при снижении LR
     )
     scaler = torch.amp.GradScaler('cuda', enabled=config.mixed_precision and torch.cuda.is_available())
     start_epoch = 0
