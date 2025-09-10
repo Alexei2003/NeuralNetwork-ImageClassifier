@@ -569,12 +569,12 @@ def run_training():
             # Расчет времени для логирования
             batch_duration = time.time() - batch_start_time
             remaining_batches = train_loader_len - (batch_idx + 1)
-            estimated_remaining_time = remaining_batches * batch_duration
+            estimated_remaining_time = remaining_batches * batch_duration * 3
 
             remaining_time_str = time.strftime('%H:%M:%S', time.gmtime(estimated_remaining_time))
             print(
                 f"\r[Train] Epoch {epoch+1}/{config.epochs} | Batch {batch_idx+1}/{train_loader_len} | "
-                f"Loss: {(loss.item()):.4f} | Remaining time: {remaining_time_str*3}",
+                f"Loss: {(loss.item()):.4f} | Remaining time: {remaining_time_str}",
                 end='', flush=True)
 
         train_accuracy = 100 * train_correct / train_total
@@ -605,12 +605,12 @@ def run_training():
                 # Расчет оставшегося времени
                 batch_duration = time.time() - batch_start_time
                 remaining_batches = val_loader_len - (batch_idx + 1)
-                estimated_remaining_time = remaining_batches * batch_duration
+                estimated_remaining_time = remaining_batches * batch_duration * 3
                 remaining_time_str = time.strftime('%H:%M:%S', time.gmtime(estimated_remaining_time))
 
                 print(
                     f"\r[Val]   Epoch {epoch+1}/{config.epochs} | Batch {batch_idx+1}/{val_loader_len} | "
-                    f"Loss: {loss.item():.4f} | Remaining: {remaining_time_str*3}",
+                    f"Loss: {loss.item():.4f} | Remaining: {remaining_time_str}",
                     end='', flush=True)
 
         print()
