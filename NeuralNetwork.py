@@ -573,7 +573,7 @@ def run_training():
             remaining_time_str = time.strftime('%H:%M:%S', time.gmtime(estimated_remaining_time))
             print(
                 f"\r[Train] Epoch {epoch+1}/{config.epochs} | Batch {batch_idx+1}/{len(train_loader)} | "
-                f"Loss: {(train_loss):.4f} | Remaining time: {remaining_time_str}",
+                f"Loss: {(loss.item()):.4f} | Remaining time: {remaining_time_str}",
                 end='', flush=True)
 
         epoch_end_time = time.time()  # Время окончания эпохи
