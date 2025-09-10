@@ -42,16 +42,15 @@ class Config:
     input_size = (224, 224)         # Размер входного изображения (ширина, высота)
 
     # Архитектура модели и гиперпараметры
-    num_experts = 8                 # Количество экспертов в MoE (Mixture of Experts)
+    num_experts = 16                # Количество экспертов в MoE (Mixture of Experts)
     expert_units = 1024             # Количество нейронов в каждом эксперте
-    k_top_expert = 2                # Количество активных экспертов на один пример
+    k_top_expert = 4                # Количество активных экспертов на один пример
     se_reduction = 16               # Коэффициент редукции для SE (Squeeze-and-Excitation) блока
     dropout = 0.5                   # Вероятность отключения нейронов (dropout)
 
     # Параметры обучения
-    accumulation_steps = 16         # Количество шагов накопления градиентов (для эффективного увеличения размера батча без увеличения памяти)
-    lr = 0.0002                     # Начальная скорость обучения (learning rate), масштабируется под accumulation_steps для стабильности
-    batch_size = 64                 # Размер батча (число примеров, обрабатываемых за один проход)
+    lr = 0.01                       # Начальная скорость обучения (learning rate)
+    batch_size = 256                # Размер батча (число примеров, обрабатываемых за один проход)
     epochs = 100                    # Количество эпох обучения (полных проходов по всему датасету)
     focal_gamma = 2                 # Параметр гамма для Focal Loss, регулирует степень фокусировки на сложных примерах
     smoothing = 0.1                 # Параметр label smoothing, задаёт уровень сглаживания меток для улучшения обобщения
@@ -112,20 +111,22 @@ class MoE(nn.Module):
         output = (selected_outputs * top_k_weights.unsqueeze(-1)).sum(dim=1)
         return output + x
 
-class SEBlock(nn.Module):
-    def __init__(self, channels):
+class ECABlock(nn.Module):
+    def __init__(self, channels, k_size=3):
         super().__init__()
-        reduced = max(1, channels // config.se_reduction)
-        self.se = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(channels, reduced, 1),
-            nn.ReLU(inplace=True) ,
-            nn.Conv2d(reduced, channels, 1),
-            nn.Sigmoid()
-        )
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        # 1D свёртка по каналам
+        self.conv = nn.Conv1d(1, 1, kernel_size=k_size,
+                              padding=(k_size - 1) // 2, bias=False)
+        self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
-        return x * self.se(x)
+        y = self.avg_pool(x)  # [B, C, 1, 1]
+        # Преобразуем в форму [B, 1, C] для 1D conv
+        y = self.conv(y.squeeze(-1).transpose(-1, -2))
+        y = self.sigmoid(y).transpose(-1, -2).unsqueeze(-1)  # [B, C, 1, 1]
+        return x * y.expand_as(x)
+
 
 class ResidualBlock(nn.Module):
     def __init__(self, in_channels, out_channels, stride=1):
@@ -134,9 +135,9 @@ class ResidualBlock(nn.Module):
         self.bn1 = nn.BatchNorm2d(out_channels)
         self.conv2 = nn.Conv2d(out_channels, out_channels, 3, padding=1, bias=False)
         self.bn2 = nn.BatchNorm2d(out_channels)
-        self.se = SEBlock(out_channels)
+        self.eca = ECABlock(out_channels)  # 🔹 заменили SE на ECA
         self.act = nn.ReLU(inplace=True)
-        self.dropout = nn.Dropout2d(config.dropout)  # Добавлен Dropout
+        self.dropout = nn.Dropout2d(config.dropout)
 
         self.shortcut = nn.Sequential()
         if stride != 1 or in_channels != out_channels:
@@ -148,9 +149,9 @@ class ResidualBlock(nn.Module):
     def forward(self, x):
         residual = self.shortcut(x)
         x = self.act(self.bn1(self.conv1(x)))
-        x = self.dropout(x)  # Добавлен Dropout
+        x = self.dropout(x)
         x = self.bn2(self.conv2(x))
-        x = self.se(x)
+        x = self.eca(x)  # 🔹 используем ECA
         return self.act(x + residual)
 
 class AnimeClassifier(nn.Module):
@@ -342,12 +343,12 @@ def forward_with_mixup_cutmix(model, inputs, labels, config, class_weights, devi
 
         with torch.amp.autocast('cuda', enabled=config.mixed_precision):
             outputs = model(inputs)
-            loss = lam * focal_loss_with_smoothing(outputs, targets_a, config.focal_gamma, config.smoothing, class_weights) / config.accumulation_steps \
-                 + (1 - lam) * focal_loss_with_smoothing(outputs, targets_b, config.focal_gamma, config.smoothing, class_weights) / config.accumulation_steps
+            loss = lam * focal_loss_with_smoothing(outputs, targets_a, config.focal_gamma, config.smoothing, class_weights)\
+                 + (1 - lam) * focal_loss_with_smoothing(outputs, targets_b, config.focal_gamma, config.smoothing, class_weights)
     else:
         with torch.amp.autocast('cuda', enabled=config.mixed_precision):
             outputs = model(inputs)
-            loss = focal_loss_with_smoothing(outputs, labels, config.focal_gamma, config.smoothing, class_weights) / config.accumulation_steps
+            loss = focal_loss_with_smoothing(outputs, labels, config.focal_gamma, config.smoothing, class_weights)
 
     return outputs, loss
 
@@ -537,7 +538,6 @@ def run_training():
         train_loss = 0.0
         train_correct, train_total = 0, 0
         optimizer.zero_grad()
-        accumulated_loss = 0.0  # Для агрегации потерь при накоплении
 
         epoch_start_time = time.time()  # Время начала эпохи
         for batch_idx, (inputs, labels) in enumerate(train_loader):
@@ -547,45 +547,33 @@ def run_training():
             outputs, loss = forward_with_mixup_cutmix(model, inputs, labels, config, class_weights, device)
             # Накопление градиентов (основное изменение)
             scaler.scale(loss).backward()
-            accumulated_loss += loss.item() * config.accumulation_steps
+            train_loss += loss.item()
 
-            # Обновление только на последнем шаге накопления
-            if (batch_idx + 1) % config.accumulation_steps == 0 or (batch_idx + 1) == len(train_loader):
-                # Градиентный клиппинг
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            # Градиентный клиппинг
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
-                # Шаг оптимизатора
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad(set_to_none=True)
+            # Шаг оптимизатора
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
 
-                # Расчет метрик только при обновлении
-                _, predicted = torch.max(outputs, 1)
-                current_batch_size = labels.size(0)
-                train_total += current_batch_size
-                train_correct += (predicted == labels).sum().item()
+            # Расчет метрик только при обновлении
+            _, predicted = torch.max(outputs, 1)
+            current_batch_size = labels.size(0)
+            train_total += current_batch_size
+            train_correct += (predicted == labels).sum().item()
 
-                # Логирование только при обновлении
-                batch_loss_value = accumulated_loss
-                train_loss += batch_loss_value
-
-                # Сброс накопленных потерь
-                accumulated_loss = 0.0
-
-                # Расчет времени для логирования
-                batch_end_time = time.time()
-                batch_duration = batch_end_time - batch_start_time
-                remaining_batches = len(train_loader) - (batch_idx + 1)
-                estimated_remaining_time = remaining_batches * batch_duration
-            else:
-                # Пропускаем логирование на промежуточных шагах
-                continue
+            # Расчет времени для логирования
+            batch_end_time = time.time()
+            batch_duration = batch_end_time - batch_start_time
+            remaining_batches = len(train_loader) - (batch_idx + 1)
+            estimated_remaining_time = remaining_batches * batch_duration
 
             remaining_time_str = time.strftime('%H:%M:%S', time.gmtime(estimated_remaining_time))
             print(
                 f"\r[Train] Epoch {epoch+1}/{config.epochs} | Batch {batch_idx+1}/{len(train_loader)} | "
-                f"Loss: {(batch_loss_value / config.accumulation_steps):.4f} | Remaining time: {remaining_time_str}",
+                f"Loss: {(train_loss):.4f} | Remaining time: {remaining_time_str}",
                 end='', flush=True)
 
         epoch_end_time = time.time()  # Время окончания эпохи
@@ -595,6 +583,7 @@ def run_training():
         total_elapsed_str = time.strftime("%H:%M:%S", time.gmtime(total_elapsed_time))
 
         train_accuracy = 100 * train_correct / train_total
+        print()
 
         # Валидация
         model.eval()
