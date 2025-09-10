@@ -533,6 +533,8 @@ def run_training():
 
     start_time = time.time()  # Засекаем время начала
     optimizer.zero_grad(set_to_none=True)  # Инициализация градиентов
+    train_loader_len = len(train_loader)
+    val_loader_len = len(val_loader)
     for epoch in range(start_epoch, config.epochs):
         model.train()
         train_loss = 0.0
@@ -565,9 +567,8 @@ def run_training():
             train_correct += (predicted == labels).sum().item()
 
             # Расчет времени для логирования
-            batch_end_time = time.time()
-            batch_duration = batch_end_time - batch_start_time
-            remaining_batches = len(train_loader) - (batch_idx + 1)
+            batch_duration = time.time() - batch_start_time
+            remaining_batches = train_loader_len - (batch_idx + 1)
             estimated_remaining_time = remaining_batches * batch_duration
 
             remaining_time_str = time.strftime('%H:%M:%S', time.gmtime(estimated_remaining_time))
@@ -576,12 +577,6 @@ def run_training():
                 f"Loss: {(loss.item()):.4f} | Remaining time: {remaining_time_str}",
                 end='', flush=True)
 
-        epoch_end_time = time.time()  # Время окончания эпохи
-        epoch_duration = epoch_end_time - epoch_start_time
-        total_elapsed_time = epoch_end_time - start_time
-        epoch_duration_str = time.strftime("%H:%M:%S", time.gmtime(epoch_duration))
-        total_elapsed_str = time.strftime("%H:%M:%S", time.gmtime(total_elapsed_time))
-
         train_accuracy = 100 * train_correct / train_total
         print()
 
@@ -589,8 +584,6 @@ def run_training():
         model.eval()
         val_loss, val_correct, val_total = 0.0, 0, 0
         all_preds, all_labels = [], []
-
-        val_loader_len = len(val_loader)
 
         with torch.inference_mode(), torch.amp.autocast('cuda', enabled=config.mixed_precision):
             for batch_idx, (inputs, labels) in enumerate(val_loader):
@@ -610,8 +603,7 @@ def run_training():
                 all_labels.extend(labels.cpu().numpy())
 
                 # Расчет оставшегося времени
-                batch_end_time = time.time()
-                batch_duration = batch_end_time - batch_start_time
+                batch_duration = time.time() - batch_start_time
                 remaining_batches = val_loader_len - (batch_idx + 1)
                 estimated_remaining_time = remaining_batches * batch_duration
                 remaining_time_str = time.strftime('%H:%M:%S', time.gmtime(estimated_remaining_time))
@@ -633,6 +625,12 @@ def run_training():
         val_precision = precision_score(all_labels, all_preds, average='macro', zero_division=0)
         val_recall = recall_score(all_labels, all_preds, average='macro', zero_division=0)
         val_f1 = f1_score(all_labels, all_preds, average='macro', zero_division=0)
+
+        epoch_end_time = time.time()  # Время окончания эпохи
+        epoch_duration = epoch_end_time - epoch_start_time
+        total_elapsed_time = epoch_end_time - start_time
+        epoch_duration_str = time.strftime("%H:%M:%S", time.gmtime(epoch_duration))
+        total_elapsed_str = time.strftime("%H:%M:%S", time.gmtime(total_elapsed_time))
 
         # Логирование
         print(f"[Summary] Train Loss: {train_loss/len(train_loader):.4f} | Acc: {train_accuracy:.2f}%")
