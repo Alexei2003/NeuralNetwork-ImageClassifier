@@ -573,8 +573,8 @@ def run_training():
 
             remaining_time_str = time.strftime('%H:%M:%S', time.gmtime(estimated_remaining_time))
             print(
-                f"\r[Train] Epoch {epoch+1}/{config.epochs} | Batch {batch_idx+1}/{len(train_loader)} | "
-                f"Loss: {(loss.item()):.4f} | Remaining time: {remaining_time_str}",
+                f"\r[Train] Epoch {epoch+1}/{config.epochs} | Batch {batch_idx+1}/{train_loader_len} | "
+                f"Loss: {(loss.item()):.4f} | Remaining time: {remaining_time_str*3}",
                 end='', flush=True)
 
         train_accuracy = 100 * train_correct / train_total
@@ -610,7 +610,7 @@ def run_training():
 
                 print(
                     f"\r[Val]   Epoch {epoch+1}/{config.epochs} | Batch {batch_idx+1}/{val_loader_len} | "
-                    f"Loss: {loss.item():.4f} | Remaining: {remaining_time_str}",
+                    f"Loss: {loss.item():.4f} | Remaining: {remaining_time_str*3}",
                     end='', flush=True)
 
         print()
