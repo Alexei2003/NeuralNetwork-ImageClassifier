@@ -24,16 +24,16 @@ class Config:
     match system:
         case "my":
             notebook = False
-            dir = "/media/alex/Programs/NEURAL_NETWORKS/"
+            dir = "/media/alex/Games/WPS/NeuralNetwork-ImageClassifier/"
         case "colab":
             notebook = True
-            dir = "/content/"
+            dir = "/content/NeuralNetwork-ImageClassifier/"
 
     # Пути к данным и моделям
-    source_dir = dir + "NeuralNetwork-ImageClassifier/DataSet/ARTS/Original"         # Папка с исходными изображениями
-    checkpoint_path = dir + "NeuralNetwork-ImageClassifier//Model/best_model.pth"     # Путь для сохранения/загрузки модели
-    labels_path = dir + "NeuralNetwork-ImageClassifier//Model/labels.txt"             # Файл с метками классов
-    onnx_path = dir + "NeuralNetwork-ImageClassifier//Model/model.onnx"               # Путь для экспортированной модели в ONNX формате
+    source_dir = dir + "DataSet/ARTS/Original"         # Папка с исходными изображениями
+    checkpoint_path = dir + "Model/best_model.pth"     # Путь для сохранения/загрузки модели
+    labels_path = dir + "Model/labels.txt"             # Файл с метками классов
+    onnx_path = dir + "Model/model.onnx"               # Путь для экспортированной модели в ONNX формате
 
     # Флаги управления обучением
     resume_training = False         # Продолжать обучение с сохраненного чекпоинта, если True
