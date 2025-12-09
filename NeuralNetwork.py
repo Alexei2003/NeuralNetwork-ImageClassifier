@@ -650,19 +650,25 @@ def convert_to_onnx():
     model.load_state_dict(model_state_dict)
     model.eval()
 
-    # Экспорт в ONNX
+    # Отключаем компиляцию для экспорта
+    model = torch._dynamo.run(model)
+
+    # Экспорт в ONNX с исправленными параметрами
     dummy_input = torch.randn(1, 3, *config.input_size).to(device)
+
+    # Убираем dynamic_axes и используем более новую версию opset
     torch.onnx.export(
         model,
         dummy_input,
         config.onnx_path,
         input_names=['input'],
         output_names=['output'],
-        dynamic_axes={'input': {0: 'batch_size'}, 'output': {0: 'batch_size'}},
-        opset_version=13,
+        opset_version=15,  # Используем более новую версию
         do_constant_folding=True,
         training=torch.onnx.TrainingMode.EVAL,
-        operator_export_type=torch.onnx.OperatorExportTypes.ONNX_ATEN_FALLBACK,
+        export_params=True,
+        verbose=False,
+        dynamic_axes=None,  # Убираем динамические оси для упрощения
     )
     print("✅ ONNX модель сохранена:", config.onnx_path)
 
