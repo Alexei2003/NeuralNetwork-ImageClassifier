@@ -75,7 +75,7 @@ class SimpleFFN(nn.Module):
             nn.ReLU(inplace=True)  # Добавляем нелинейность
         )
         self.norm = nn.LayerNorm(input_dim)  # Добавляем нормировку
-        
+
     def forward(self, x):
         residual = x
         x = self.ffn(x)
@@ -148,7 +148,7 @@ class AnimeClassifier(nn.Module):
 
     def forward(self, x):
         x = self.backbone(x).flatten(1)
-        x = self.moe(x)
+        x = self.ffn(x)
         return self.classifier(x)
 
 # ====================== ОБРАБОТКА ДАННЫХ ======================
