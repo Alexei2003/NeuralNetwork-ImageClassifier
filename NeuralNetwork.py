@@ -42,9 +42,6 @@ class Config:
     input_size = (224, 224)         # Размер входного изображения (ширина, высота)
 
     # Архитектура модели и гиперпараметры
-    num_experts = 16                # Количество экспертов в MoE (Mixture of Experts)
-    expert_units = 1024             # Количество нейронов в каждом эксперте
-    k_top_expert = 4                # Количество активных экспертов на один пример
     se_reduction = 16               # Коэффициент редукции для SE (Squeeze-and-Excitation) блока
     dropout = 0.5                   # Вероятность отключения нейронов (dropout)
 
@@ -66,50 +63,23 @@ class Config:
 config = Config()
 
 # ====================== КОМПОНЕНТЫ МОДЕЛИ ======================
-class MoE(nn.Module):
-    def __init__(self, input_dim, num_experts, expert_units, k_top):
+class SimpleFFN(nn.Module):
+    """Замена MoE на простую feed-forward сеть"""
+    def __init__(self, input_dim, hidden_dim=2048, dropout=config.dropout):
         super().__init__()
-        self.num_experts = num_experts
-        self.k_top = k_top
-        self.experts = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(input_dim, expert_units),
-                nn.ReLU(inplace=True) ,
-                nn.Dropout(config.dropout),
-                nn.Linear(expert_units, input_dim))
-            for _ in range(num_experts)
-        ])
-        self.router = nn.Linear(input_dim, num_experts)
-
+        self.ffn = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, input_dim),
+            nn.ReLU(inplace=True)  # Добавляем нелинейность
+        )
+        self.norm = nn.LayerNorm(input_dim)  # Добавляем нормировку
+        
     def forward(self, x):
-        logits = self.router(x)
-        top_k_weights, top_k_indices = logits.topk(self.k_top, dim=1)
-        top_k_weights = torch.softmax(top_k_weights, dim=1)
-
-        # Создаем тензор всех экспертных выходов
-        expert_outputs = torch.stack([expert(x) for expert in self.experts], dim=1)  # [B, num_experts, D]
-
-        # Создаем маску для выбранных экспертов [B, num_experts, D]
-        mask = torch.zeros_like(expert_outputs)
-        mask = torch.scatter(
-            mask,
-            1,
-            top_k_indices.unsqueeze(-1).expand(-1, -1, expert_outputs.size(-1)),
-            1.0
-        )
-
-        # Объединяем градиенты только для выбранных экспертов
-        expert_outputs = expert_outputs * mask + (expert_outputs * (1 - mask)).detach()
-
-        # Выбираем топ-k экспертов
-        selected_outputs = expert_outputs.gather(
-            1,
-            top_k_indices.unsqueeze(-1).expand(-1, -1, expert_outputs.size(-1))
-        )
-
-        # Взвешенное суммирование
-        output = (selected_outputs * top_k_weights.unsqueeze(-1)).sum(dim=1)
-        return output + x
+        residual = x
+        x = self.ffn(x)
+        return self.norm(x + residual)  # Residual connection + LayerNorm
 
 class ECABlock(nn.Module):
     def __init__(self, channels, k_size=3):
@@ -168,7 +138,7 @@ class AnimeClassifier(nn.Module):
             ResidualBlock(256, 512, stride=2),
             nn.AdaptiveAvgPool2d(1)
         )
-        self.moe = MoE(512, config.num_experts, config.expert_units, config.k_top_expert)
+        self.ffn = SimpleFFN(512, hidden_dim=2048, dropout=config.dropout)
         self.classifier = nn.Sequential(
             nn.Linear(512, 512),
             nn.ReLU(inplace=True),
@@ -692,7 +662,7 @@ def convert_to_onnx():
         opset_version=13,
         do_constant_folding=True,
         training=torch.onnx.TrainingMode.EVAL,
-        operator_export_type=torch.onnx.OperatorExportTypes.ONNX_ATEN_FALLBACK
+        operator_export_type=torch.onnx.OperatorExportTypes.ONNX_ATEN_FALLBACK,
     )
     print("✅ ONNX модель сохранена:", config.onnx_path)
 
@@ -705,7 +675,7 @@ def test_onnx():
     session = ort.InferenceSession(config.onnx_path)
 
     try:
-        img = Image.open(config.dir +"NeuralNetwork-ImageClassifier//test.jpg").convert('RGB')
+        img = Image.open(config.dir +"test.jpg").convert('RGB')
         img_np = np.array(img)
 
         # Применение преобразований
