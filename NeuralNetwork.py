@@ -705,7 +705,7 @@ def test_onnx():
     session = ort.InferenceSession(config.onnx_path)
 
     try:
-        img = Image.open(config.dir +"NeuralNetwork-ImageClassifier//test.jpg").convert('RGB')
+        img = Image.open(config.dir +"test.jpg").convert('RGB')
         img_np = np.array(img)
 
         # Применение преобразований
