@@ -44,7 +44,7 @@ class Config:
     # Архитектура модели и гиперпараметры
     num_experts = 32                # Количество экспертов в MoE (Mixture of Experts)
     expert_units = 1024             # Количество нейронов в каждом эксперте
-    k_top_expert = 4                # Количество активных экспертов на один пример
+    k_top_expert = 8                # Количество активных экспертов на один пример
     se_reduction = 16               # Коэффициент редукции для SE (Squeeze-and-Excitation) блока
     dropout = 0.5                   # Вероятность отключения нейронов (dropout)
 
@@ -67,21 +67,32 @@ config = Config()
 
 # ====================== КОМПОНЕНТЫ МОДЕЛИ ======================
 class MoE(nn.Module):
-    def __init__(self, input_dim, num_experts, expert_units, k_top):
+    def __init__(self, input_dim, num_experts, base_expert_units, k_top):
         super().__init__()
         self.num_experts = num_experts
         self.k_top = k_top
-        self.experts = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(input_dim, expert_units),
-                nn.BatchNorm1d(expert_units),
+        self.experts = nn.ModuleList()
+        
+        # Создаем список размеров экспертов от 0.5 до 1.5 от базового
+        expert_sizes = []
+        for i in range(num_experts):
+            # Линейная интерполяция от 0.5 до 1.5
+            scale = 0.5 + (i / (num_experts - 1)) if num_experts > 1 else 1.0
+            size = int(base_expert_units * scale)
+            expert_sizes.append(size)
+        
+        print(f"MoE expert sizes: {expert_sizes}")
+        
+        for size in expert_sizes:
+            self.experts.append(nn.Sequential(
+                nn.Linear(input_dim, size),
+                nn.BatchNorm1d(size),
                 nn.ReLU(inplace=True),
                 nn.Dropout(config.dropout),
-                nn.Linear(expert_units, input_dim),
-                nn.BatchNorm1d(input_dim) 
-            )
-            for _ in range(num_experts)
-        ])
+                nn.Linear(size, input_dim),
+                nn.BatchNorm1d(input_dim)
+            ))
+        
         self.router = nn.Linear(input_dim, num_experts)
 
     def forward(self, x):
@@ -89,10 +100,13 @@ class MoE(nn.Module):
         top_k_weights, top_k_indices = logits.topk(self.k_top, dim=1)
         top_k_weights = torch.softmax(top_k_weights, dim=1)
 
-        # Создаем тензор всех экспертных выходов
-        expert_outputs = torch.stack([expert(x) for expert in self.experts], dim=1)  # [B, num_experts, D]
+        # Собираем выходы всех экспертов
+        expert_outputs = []
+        for expert in self.experts:
+            expert_outputs.append(expert(x))
+        expert_outputs = torch.stack(expert_outputs, dim=1)  # [B, num_experts, D]
 
-        # Создаем маску для выбранных экспертов [B, num_experts, D]
+        # Создаем маску для выбранных экспертов
         mask = torch.zeros_like(expert_outputs)
         mask = torch.scatter(
             mask,
