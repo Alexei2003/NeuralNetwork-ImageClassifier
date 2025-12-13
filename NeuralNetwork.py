@@ -74,9 +74,12 @@ class MoE(nn.Module):
         self.experts = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(input_dim, expert_units),
-                nn.ReLU(inplace=True) ,
+                nn.BatchNorm1d(expert_units),
+                nn.ReLU(inplace=True),
                 nn.Dropout(config.dropout),
-                nn.Linear(expert_units, input_dim))
+                nn.Linear(expert_units, input_dim),
+                nn.BatchNorm1d(input_dim) 
+            )
             for _ in range(num_experts)
         ])
         self.router = nn.Linear(input_dim, num_experts)
