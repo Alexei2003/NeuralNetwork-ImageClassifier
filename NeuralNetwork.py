@@ -42,9 +42,9 @@ class Config:
     input_size = (224, 224)         # Размер входного изображения (ширина, высота)
 
     # Архитектура модели и гиперпараметры
-    num_experts = 32                # Количество экспертов в MoE (Mixture of Experts)
+    num_experts = 16                # Количество экспертов в MoE (Mixture of Experts)
     expert_units = 1024             # Количество нейронов в каждом эксперте
-    k_top_expert = 8                # Количество активных экспертов на один пример
+    k_top_expert = 4                # Количество активных экспертов на один пример
     se_reduction = 16               # Коэффициент редукции для SE (Squeeze-and-Excitation) блока
     dropout = 0.5                   # Вероятность отключения нейронов (dropout)
 
@@ -72,7 +72,7 @@ class MoE(nn.Module):
         self.num_experts = num_experts
         self.k_top = k_top
         self.experts = nn.ModuleList()
-        
+
         # Создаем список размеров экспертов от 0.5 до 1.5 от базового
         expert_sizes = []
         for i in range(num_experts):
@@ -80,9 +80,9 @@ class MoE(nn.Module):
             scale = 0.5 + (i / (num_experts - 1)) if num_experts > 1 else 1.0
             size = int(base_expert_units * scale)
             expert_sizes.append(size)
-        
+
         print(f"MoE expert sizes: {expert_sizes}")
-        
+
         for size in expert_sizes:
             self.experts.append(nn.Sequential(
                 nn.Linear(input_dim, size),
@@ -92,7 +92,7 @@ class MoE(nn.Module):
                 nn.Linear(size, input_dim),
                 nn.BatchNorm1d(input_dim)
             ))
-        
+
         self.router = nn.Linear(input_dim, num_experts)
 
     def forward(self, x):
