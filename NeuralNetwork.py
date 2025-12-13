@@ -689,7 +689,6 @@ def convert_to_onnx():
         input_names=['input'],
         output_names=['output'],
         dynamic_axes={'input': {0: 'batch_size'}, 'output': {0: 'batch_size'}},
-        opset_version=13,
         do_constant_folding=True,
         training=torch.onnx.TrainingMode.EVAL,
         operator_export_type=torch.onnx.OperatorExportTypes.ONNX_ATEN_FALLBACK
