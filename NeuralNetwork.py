@@ -666,8 +666,8 @@ def run_training():
 
         # Уменьшение скорости обучения
         current_lr = optimizer.param_groups[0]['lr']
-        if best_loss > val_loss:
-            next_lr = next_lr * config.factor_lr
+        if val_loss > best_loss:
+            next_lr = current_lr * config.factor_lr
             optimizer = optim.AdamW(model.parameters(), lr=next_lr)
         else:
             next_lr = current_lr
