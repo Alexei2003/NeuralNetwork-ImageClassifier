@@ -210,7 +210,7 @@ class ImageDataset(Dataset):
             self.classes = sorted(os.listdir(root))
             with open(config.labels_path, 'w') as f:
                 f.write('\n'.join(self.classes))
-        
+
         self.samples = []
         for label, cls in enumerate(self.classes):
             cls_path = os.path.join(root, cls)
@@ -394,7 +394,7 @@ def save_compressed_checkpoint(model, epoch, best_loss, lr, path):
         'best_loss': best_loss,
         'learning_rate': lr,
     }
-    
+
     # 2. Сжимаем ВСЕ веса в float16 (даже если они float32)
     compressed_weights = {}
     for name, param in model.state_dict().items():
@@ -403,27 +403,27 @@ def save_compressed_checkpoint(model, epoch, best_loss, lr, path):
             compressed_weights[name] = param.half().clone()  # Важно: .clone()
         else:
             compressed_weights[name] = param
-    
+
     checkpoint['model_state_dict'] = compressed_weights
-    
+
     # 3. Сохраняем с максимальным сжатием
     with gzip.open(path, 'wb', compresslevel=9) as f:
         torch.save(checkpoint, f, pickle_protocol=4)
-    
+
     # 4. Показываем результат сжатия
     size_mb = os.path.getsize(path) / 1024 / 1024
-    
+
     # Сравниваем с размером без сжатия
     temp_path = path + '.tmp'
     torch.save(checkpoint, temp_path)  # Без сжатия
     uncompressed_size = os.path.getsize(temp_path) / 1024 / 1024
     os.remove(temp_path)
-    
+
     compression_ratio = (1 - size_mb / uncompressed_size) * 100
-    
+
     print(f"[System]  Чекпоинт сохранен: {size_mb:.1f} MB")
     print(f"[System]  Сжатие: {compression_ratio:.0f}% от {uncompressed_size:.1f} MB")
-    
+
     return size_mb
 
 def load_compressed_checkpoint(model, path, device):
@@ -434,18 +434,18 @@ def load_compressed_checkpoint(model, path, device):
         # 1. Загружаем
         with gzip.open(path, 'rb') as f:
             checkpoint = torch.load(f, map_location='cpu', weights_only=False)
-        
+
         # 2. Получаем сохраненные веса
         saved_weights = checkpoint['model_state_dict']
         current_weights = model.state_dict()
         loaded_weights = {}
-        
+
         # 3. Восстанавливаем с правильными типами данных
         for name in current_weights.keys():
             if name in saved_weights:
                 saved_param = saved_weights[name]
                 current_param = current_weights[name]
-                
+
                 if saved_param.is_floating_point() and current_param.is_floating_point():
                     # Восстанавливаем в оригинальный dtype модели
                     loaded_weights[name] = saved_param.to(current_param.dtype)
@@ -455,23 +455,23 @@ def load_compressed_checkpoint(model, path, device):
                 # Если веса не найдены, оставляем как есть
                 loaded_weights[name] = current_weights[name]
                 print(f"⚠️  Пропущен параметр: {name}")
-        
+
         # 4. Загружаем в модель
         model.load_state_dict(loaded_weights)
         model.to(device)
-        
+
         print(f"✓ Чекпоинт загружен")
         print(f"  Эпоха: {checkpoint['epoch']}")
         print(f"  Best loss: {checkpoint['best_loss']:.4f}")
         print(f"  LR: {checkpoint['learning_rate']:.6f}")
-        
+
         return {
             'model': model,
             'epoch': checkpoint['epoch'],
             'best_loss': checkpoint['best_loss'],
             'learning_rate': checkpoint['learning_rate'],
         }
-        
+
     except Exception as e:
         print(f"❌ Ошибка загрузки: {e}")
         import traceback
@@ -540,18 +540,18 @@ def run_training():
     if config.resume_training:
         # Просто загружаем сжатый чекпоинт
         loaded = load_compressed_checkpoint(model, config.checkpoint_path, device)
-        
+
         if loaded is not None:
             # Получаем модель из чекпоинта
             model = loaded['model']
-            
+
             # Создаем оптимизатор с сохраненным LR
             optimizer = optim.AdamW(model.parameters(), lr=loaded['learning_rate'])
-            
+
             # Восстанавливаем состояние обучения
             start_epoch = loaded['epoch'] + 1
             best_loss = loaded['best_loss']
-            
+
             # Создаем scheduler и scaler
             plateau_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
                 optimizer,
@@ -562,10 +562,10 @@ def run_training():
                 threshold_mode='rel',
             )
             scaler = torch.amp.GradScaler('cuda', enabled=config.mixed_precision and torch.cuda.is_available())
-            
+
             # Компиляция модели
             compile_model(model)
-            
+
             print(f"🔄 Продолжение обучения с эпохи {start_epoch}, LR={loaded['learning_rate']:.6f}")
         else:
             # Если не удалось загрузить, начинаем с нуля
@@ -731,37 +731,37 @@ def run_training():
 # ====================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ======================
 def convert_to_onnx():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
+
     # Загружаем классы
     with open(config.labels_path) as f:
         classes = [line.strip() for line in f]
-    
+
     # Создаем модель
     model = AnimeClassifier(len(classes)).to(device)
-    
+
     # Загружаем сжатый чекпоинт
     loaded = load_compressed_checkpoint(model, config.checkpoint_path, device)
-    
+
     if loaded is None:
         print("❌ Не удалось загрузить чекпоинт для конвертации в ONNX!")
         return
-    
+
     model = loaded['model']
     model.eval()
-    
+
     # Удаляем префикс _orig_mod. если модель была скомпилирована
     model_state_dict = model.state_dict()
     if any('_orig_mod.' in key for key in model_state_dict.keys()):
         # Если модель была скомпилирована, нужно ее декомпилировать
         model = torch._dynamo.run(model)
-    
+
     print(f"✅ Модель загружена для ONNX экспорта")
     print(f"   Классов: {len(classes)}")
     print(f"   Устройство: {device}")
-    
+
     # Экспорт в ONNX
     dummy_input = torch.randn(1, 3, *config.input_size).to(device)
-    
+
     try:
         torch.onnx.export(
             model,
@@ -776,12 +776,12 @@ def convert_to_onnx():
             verbose=False
         )
         print(f"✅ ONNX модель сохранена: {config.onnx_path}")
-        
+
         # Проверяем размер файла
         if os.path.exists(config.onnx_path):
             size_mb = os.path.getsize(config.onnx_path) / 1024 / 1024
             print(f"   Размер ONNX файла: {size_mb:.2f} MB")
-        
+
     except Exception as e:
         print(f"❌ Ошибка при экспорте в ONNX: {e}")
         import traceback
@@ -798,10 +798,10 @@ def test_onnx():
         # Настраиваем сессию ONNX Runtime
         options = ort.SessionOptions()
         options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        
+
         # Используем доступные провайдеры
         providers = ['CUDAExecutionProvider', 'CPUExecutionProvider'] if torch.cuda.is_available() else ['CPUExecutionProvider']
-        
+
         session = ort.InferenceSession(config.onnx_path, options, providers=providers)
         print("✅ ONNX Runtime сессия создана")
     except Exception as e:
@@ -823,7 +823,7 @@ def test_onnx():
         transform = ImageDataset._get_transforms('val')
         augmented = transform(image=img_np)
         img_tensor = augmented['image'].unsqueeze(0)
-        
+
         print(f"✅ Изображение загружено: {img.size[0]}x{img.size[1]}")
     except Exception as e:
         print(f"❌ Ошибка загрузки изображения: {e}")
@@ -831,19 +831,19 @@ def test_onnx():
 
     # ====================== PyTorch предсказание ======================
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
+
     # Загружаем классы
     with open(config.labels_path) as f:
         classes = [line.strip() for line in f]
-    
+
     # Инициализация и загрузка PyTorch-модели
     model = AnimeClassifier(len(classes)).to(device)
     loaded = load_compressed_checkpoint(model, config.checkpoint_path, device)
-    
+
     if loaded is None:
         print("❌ Не удалось загрузить PyTorch модель для сравнения!")
         return
-    
+
     model = loaded['model']
     model.eval()
 
@@ -856,18 +856,18 @@ def test_onnx():
     try:
         # Подготавливаем входные данные для ONNX
         onnx_input = img_tensor.numpy().astype(np.float32)
-        
+
         # Запускаем inference
         onnx_outputs = session.run(None, {'input': onnx_input})
         onnx_probs = torch.softmax(torch.tensor(onnx_outputs[0]), dim=1)
-        
+
         print("✅ ONNX inference выполнен успешно")
     except Exception as e:
         print(f"❌ Ошибка ONNX inference: {e}")
         return
 
     # ====================== Вывод результатов ======================
-    
+
     # Результаты PyTorch
     print("\n" + "="*50)
     print("[PyTorch] Топ-5 предсказаний:")
@@ -884,21 +884,21 @@ def test_onnx():
     # Проверка совпадения результатов
     diff = torch.max(torch.abs(pytorch_probs - onnx_probs)).item()
     print(f"\n[Сравнение] Расхождение между выходами: {diff:.6f}")
-    
+
     if diff < 0.001:
         print("✅ Конвертация успешна! Расхождение < 0.001")
     elif diff < 0.01:
         print("⚠️  Небольшое расхождение (0.001-0.01), возможно из-за численной точности")
     else:
         print("❌ Большое расхождение (> 0.01)! Возможная ошибка конвертации")
-        
+
     # Дополнительная информация
     print("\n" + "="*50)
     print(f"PyTorch device: {device}")
     print(f"PyTorch dtype: {pytorch_probs.dtype}")
     print(f"ONNX dtype: {onnx_probs.dtype}")
     print(f"Количество классов: {len(classes)}")
-    
+
 def get_classes():
   with open(config.labels_path) as f:
       return [line.strip() for line in f]
