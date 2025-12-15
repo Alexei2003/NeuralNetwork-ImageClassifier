@@ -55,14 +55,12 @@ class Config:
     epochs = 100                    # Количество эпох обучения (полных проходов по всему датасету)
     focal_gamma = 5                 # Параметр гамма для Focal Loss, регулирует степень фокусировки на сложных примерах
     smoothing = 0.1                 # Параметр label smoothing, задаёт уровень сглаживания меток для улучшения обобщения
-    threshold = 1e-2                # Разница val loss для уменьшения learning rate
 
     # Настройки оптимизации и контроля обучения
     mixed_precision = True          # Использовать смешанную точность (fp16) для ускорения обучения
     early_stopping_patience = 5     # Количество эпох без улучшения для ранней остановки
     val_split = 0.2                 # Доля данных, выделяемая под валидацию
     factor_lr = 0.5                 # Коэффициент уменьшения learning rate при plateau
-    patience_lr = 0                 # Количество эпох без улучшения для снижения learning rate
 
 config = Config()
 
@@ -524,14 +522,6 @@ def run_training():
     class_weights = get_class_weights_from_dirs(config.source_dir, full_classes).to(device)
 
     optimizer = optim.AdamW(model.parameters(), lr=config.lr)
-    plateau_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode='min',
-        factor=config.factor_lr,
-        patience=config.patience_lr,
-        threshold=config.threshold, # ← игнорирует минимальные изменения
-        threshold_mode='rel',       # ← относительное сравнение
-    )
     scaler = torch.amp.GradScaler('cuda', enabled=config.mixed_precision and torch.cuda.is_available())
     start_epoch = 0
     best_loss = float('inf')
@@ -552,15 +542,6 @@ def run_training():
             start_epoch = loaded['epoch'] + 1
             best_loss = loaded['best_loss']
 
-            # Создаем scheduler и scaler
-            plateau_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                optimizer,
-                mode='min',
-                factor=config.factor_lr,
-                patience=config.patience_lr,
-                threshold=config.threshold,
-                threshold_mode='rel',
-            )
             scaler = torch.amp.GradScaler('cuda', enabled=config.mixed_precision and torch.cuda.is_available())
 
             # Компиляция модели
@@ -683,11 +664,14 @@ def run_training():
 
         print()
 
-        current_lr = optimizer.param_groups[0]['lr']
         # Уменьшение скорости обучения
-        plateau_scheduler.step(val_loss)
-        next_lr = optimizer.param_groups[0]['lr']
-
+        current_lr = optimizer.param_groups[0]['lr']
+        if best_loss > val_loss:
+            next_lr = next_lr * config.factor_lr
+            optimizer = optim.AdamW(model.parameters(), lr=next_lr)
+        else:
+            next_lr = current_lr
+        
         # Расчет метрик
         val_accuracy = 100 * val_correct / val_total
         val_precision = precision_score(all_labels, all_preds, average='macro', zero_division=0)
