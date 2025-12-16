@@ -671,7 +671,7 @@ def run_training():
             optimizer = optim.AdamW(model.parameters(), lr=next_lr)
         else:
             next_lr = current_lr
-        
+
         # Расчет метрик
         val_accuracy = 100 * val_correct / val_total
         val_precision = precision_score(all_labels, all_preds, average='macro', zero_division=0)
