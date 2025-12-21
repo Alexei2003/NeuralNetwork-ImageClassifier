@@ -50,7 +50,7 @@ class Config:
     dropout = 0.5                   # Вероятность отключения нейронов (dropout)
 
     # Параметры обучения
-    lr = 0.002                      # Начальная скорость обучения (learning rate)
+    lr = 0.01                       # Начальная скорость обучения (learning rate)
     batch_size = 512                # Размер батча (число примеров, обрабатываемых за один проход)
     epochs = 100                    # Количество эпох обучения (полных проходов по всему датасету)
     focal_gamma = 5                 # Параметр гамма для Focal Loss, регулирует степень фокусировки на сложных примерах
@@ -315,7 +315,7 @@ def get_class_weights_from_dirs(root_dir, class_names):
     total = sum(class_counts)
     weights = [total / (count + 1e-6) for count in class_counts]  # защита от деления на 0
     weights = torch.tensor(weights)
-    weights = weights / weights.mean()  # нормализация
+    weights = weights / weights.max()  # нормализация
     return weights
 
 def focal_loss_with_smoothing(outputs, targets, gamma=5.0, smoothing=0.1, class_weights=None):
