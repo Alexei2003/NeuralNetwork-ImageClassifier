@@ -20,15 +20,7 @@ import gzip
 # ====================== КОНФИГУРАЦИЯ ======================
 class Config:
     # выбор системы
-    system = "colab"
-
-    match system:
-        case "my":
-            notebook = False
-            dir = "/media/alex/Games/WPS/NeuralNetwork-ImageClassifier/"
-        case "colab":
-            notebook = True
-            dir = "/content/NeuralNetwork-ImageClassifier/"
+    dir = "/content/NeuralNetwork-ImageClassifier/"
 
     # Пути к данным и моделям
     source_dir = dir + "DataSet/ARTS/Original"         # Папка с исходными изображениями
@@ -43,9 +35,9 @@ class Config:
     input_size = (224, 224)         # Размер входного изображения (ширина, высота)
 
     # Архитектура модели и гиперпараметры
-    num_experts = 32                # Количество экспертов в MoE (Mixture of Experts)
+    num_experts = 64                # Количество экспертов в MoE (Mixture of Experts)
     expert_units = 1024             # Количество нейронов в каждом эксперте
-    k_top_expert = 8                # Количество активных экспертов на один пример
+    k_top_expert = 4                # Количество активных экспертов на один пример
     se_reduction = 16               # Коэффициент редукции для SE (Squeeze-and-Excitation) блока
     dropout = 0.5                   # Вероятность отключения нейронов (dropout)
 
