@@ -54,7 +54,7 @@ class Config:
     early_stopping_patience = 5     # Количество эпох без улучшения для ранней остановки
     val_split = 0.2                 # Доля данных, выделяемая под валидацию
     factor_lr = 0.5                 # Коэффициент уменьшения learning rate при plateau
-    patience_lr = 0                 # Количество эпох без улучшения для снижения learning rate
+    patience_lr = 1                 # Количество эпох без улучшения для снижения learning rate
 
 config = Config()
 
