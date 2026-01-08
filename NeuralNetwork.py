@@ -9,12 +9,9 @@ from PIL import Image
 import onnxruntime as ort
 from sklearn.metrics import precision_score, recall_score, f1_score
 import time
-from torchinfo import summary
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 import torch.backends.cudnn
-import torch.nn.functional as F
-import matplotlib.pyplot as plt
 import gzip
 
 # ====================== КОНФИГУРАЦИЯ ======================
@@ -42,21 +39,122 @@ class Config:
     dropout = 0.5                   # Вероятность отключения нейронов (dropout)
 
     # Параметры обучения
-    lr = 0.002                      # Начальная скорость обучения (learning rate)
-    batch_size = 512                # Размер батча (число примеров, обрабатываемых за один проход)
+    val_split = 0.2                 # Доля данных, выделяемая под валидацию
+    gradient_clip = 1.0             # Максимальная норма градиента
+    batch_size = 256                # Размер батча (число примеров, обрабатываемых за один проход)
     epochs = 100                    # Количество эпох обучения (полных проходов по всему датасету)
     focal_gamma = 5                 # Параметр гамма для Focal Loss, регулирует степень фокусировки на сложных примерах
     smoothing = 0.1                 # Параметр label smoothing, задаёт уровень сглаживания меток для улучшения обобщения
-    threshold = 1e-2                # Разница val loss для уменьшения learning rate
-
-    # Настройки оптимизации и контроля обучения
     mixed_precision = True          # Использовать смешанную точность (fp16) для ускорения обучения
+
+    # Параметры LR
+    max_lr = 0.01                   # Максимальная скорость обучения (learning rate)
+    ini_lr = 0.001                  # Начальная скорость обучения
+    warmup_epochs = 4               # Количество эпох для прогрева LR
+    plateau_patience = 1            # Ждать эпохи без улучшения
+    plateau_factor = 0.75           # Уменьшать lr
+    plateau_threshold = 0.0001      # Порог улучшения (относительный)
     early_stopping_patience = 5     # Количество эпох без улучшения для ранней остановки
-    val_split = 0.2                 # Доля данных, выделяемая под валидацию
-    factor_lr = 0.5                 # Коэффициент уменьшения learning rate при plateau
-    patience_lr = 1                 # Количество эпох без улучшения для снижения learning rate
 
 config = Config()
+
+# ====================== КОСИНУСНЫЙ ШЕДУЛЕР С WARMUP ======================
+class WarmupReduceLROnPlateau():
+    """Warmup + ReduceLROnPlateau логика"""
+
+    def __init__(self, optimizer, warmup_epochs, ini_lr, max_lr, patience, factor, threshold):
+        self.optimizer = optimizer
+        self.warmup_epochs = warmup_epochs
+        self.ini_lr = ini_lr
+        self.max_lr = max_lr
+        self.current_epoch = 0
+
+        # ReduceLROnPlateau параметры
+        self.patience = patience
+        self.factor = factor
+        self.threshold = threshold
+        self.num_reduced = 0
+
+        # Трекинг лучшего loss
+        self.best_loss = float('inf')
+        self.num_bad_epochs = 0
+
+    def step(self, epoch=None, validation_loss=None):
+        """Вызывается в конце каждой эпохи с validation_loss"""
+        if epoch is not None:
+            self.current_epoch = epoch
+        else:
+            self.current_epoch += 1
+
+        # Warmup фаза
+        if self.current_epoch <= self.warmup_epochs:
+            if self.current_epoch == 1:
+                lr = self.ini_lr
+            else:
+                lr = self.max_lr * (self.current_epoch / self.warmup_epochs)
+
+            # Устанавливаем LR
+            for param_group in self.optimizer.param_groups:
+                param_group['lr'] = lr
+
+            self.best_loss = validation_loss  # Сбрасываем best loss в warmup
+            print(f"[Warmup {self.current_epoch-1}/{self.warmup_epochs}]")
+            return lr
+
+        # Если validation_loss не передан, просто продолжаем текущий LR
+        if validation_loss is None:
+            return self.optimizer.param_groups[0]['lr']
+
+        # ReduceLROnPlateau логика
+        current_lr = self.optimizer.param_groups[0]['lr']
+
+        if self._is_better(validation_loss, self.best_loss):
+            self.best_loss = validation_loss
+            self.num_bad_epochs = 0
+            print(f"✓ Улучшение! Loss новый LR: {current_lr:.6f}")
+        else:
+            self.num_bad_epochs += 1
+            print(f"⚠️  Плохих эпох: {self.num_bad_epochs}/{self.patience}")
+
+        # Проверяем, нужно ли уменьшать LR
+        if self.num_bad_epochs > self.patience:
+            self._reduce_lr()
+            self.num_bad_epochs = 0
+            print(f"📉 Уменьшение LR! Новый LR: {self.optimizer.param_groups[0]['lr']:.6f}")
+
+        return self.optimizer.param_groups[0]['lr']
+
+    def _is_better(self, current, best):
+        """Проверка, лучше ли текущий loss"""
+        return current < best - best * self.threshold
+
+    def _reduce_lr(self):
+        """Уменьшение LR для всех групп параметров"""
+        self.num_reduced += 1
+        for param_group in self.optimizer.param_groups:
+            old_lr = param_group['lr']
+            new_lr = old_lr * (self.factor**self.num_reduced)
+            param_group['lr'] = new_lr
+
+
+    def get_last_lr(self):
+        return self.optimizer.param_groups[0]['lr']
+
+    def state_dict(self):
+        return {
+            'current_epoch': self.current_epoch,
+            'warmup_epochs': self.warmup_epochs,
+            'ini_lr': self.ini_lr,
+            'max_lr': self.max_lr,
+            'best_loss': self.best_loss,
+            'patience': self.patience,
+            'factor': self.factor,
+            'threshold': self.threshold,
+        }
+
+    def load_state_dict(self, state_dict):
+        for key, value in state_dict.items():
+            setattr(self, key, value)
 
 # ====================== КОМПОНЕНТЫ МОДЕЛИ ======================
 class MoE(nn.Module):
@@ -235,8 +333,8 @@ class ImageDataset(Dataset):
                 A.RandomResizedCrop(
                     size=config.input_size,
                     scale=(0.8, 1.0),
-                    ratio=(0.75, 1.33),          # Опционально (по умолчанию (0.75, 1.33))
-                    interpolation=1,             # BILINEAR
+                    ratio=(0.75, 1.33),
+                    interpolation=1,
                     p=1.0
                 ),
                 A.HorizontalFlip(p=0.5),
@@ -244,7 +342,7 @@ class ImageDataset(Dataset):
                     brightness=0.2,
                     contrast=0.2,
                     saturation=0.2,
-                    hue=0.0,                     # Обязательный параметр
+                    hue=0.1,  # Добавили hue для лучшей аугментации
                     p=0.5
                 ),
                 A.GaussianBlur(blur_limit=(3, 3), p=0.2),
@@ -257,6 +355,7 @@ class ImageDataset(Dataset):
                 ToTensorV2(),
             ])
         return A.Compose([
+            A.Resize(config.input_size[0], config.input_size[1]),  # Добавили Resize для валидации
             A.ToFloat(max_value=255.0),
             ToTensorV2(),
         ])
@@ -330,20 +429,6 @@ def focal_loss_with_smoothing(outputs, targets, gamma=5.0, smoothing=0.1, class_
 
     return torch.mean(focal_factor * loss)
 
-def imshow(img_tensor, title=None):
-    # img_tensor: Tensor с форматом (C, H, W)
-    # Преобразуем тензор в numpy для matplotlib и нормализуем к [0,1]
-    img = img_tensor.cpu().numpy()
-    img = np.transpose(img, (1, 2, 0))  # C,H,W -> H,W,C
-    img = np.clip(img, 0, 1)  # Чтобы избежать проблем с цветами
-
-    plt.imshow(img)
-    if title:
-        plt.title(title)
-    plt.axis('off')
-    plt.savefig('output_image.png')
-    plt.close()
-
 def forward_with_mixup_cutmix(model, inputs, labels, config, class_weights, device):
     inputs, labels = inputs.to(device), labels.to(device)
 
@@ -355,8 +440,6 @@ def forward_with_mixup_cutmix(model, inputs, labels, config, class_weights, devi
             inputs, targets_a, targets_b, lam = cutmix_data(inputs, labels, alpha=1.0)
         else:
             inputs, targets_a, targets_b, lam = mixup_data(inputs, labels, alpha=1.0)
-
-        #imshow(inputs[1], title="Original image")
 
         with torch.amp.autocast('cuda', enabled=config.mixed_precision):
             outputs = model(inputs)
@@ -376,23 +459,22 @@ def compile_model(model):
         fullgraph=False)
     torch.cuda.empty_cache()
 
-def save_compressed_checkpoint(model, epoch, best_loss, lr, path):
+def save_compressed_checkpoint(model, epoch, optimizer, scheduler, path):
     """
     Умное сжатие с учетом mixed precision
     """
     # 1. Определяем, какие веса можно сжимать
     checkpoint = {
         'epoch': epoch,
-        'best_loss': best_loss,
-        'learning_rate': lr,
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
     }
 
-    # 2. Сжимаем ВСЕ веса в float16 (даже если они float32)
+    # 2. Сжимаем ВСЕ веса в float16
     compressed_weights = {}
     for name, param in model.state_dict().items():
         if param.is_floating_point():
-            # Принудительно в float16 для сжатия
-            compressed_weights[name] = param.half().clone()  # Важно: .clone()
+            compressed_weights[name] = param.half().clone()
         else:
             compressed_weights[name] = param
 
@@ -404,10 +486,8 @@ def save_compressed_checkpoint(model, epoch, best_loss, lr, path):
 
     # 4. Показываем результат сжатия
     size_mb = os.path.getsize(path) / 1024 / 1024
-
-    # Сравниваем с размером без сжатия
     temp_path = path + '.tmp'
-    torch.save(checkpoint, temp_path)  # Без сжатия
+    torch.save(checkpoint, temp_path)
     uncompressed_size = os.path.getsize(temp_path) / 1024 / 1024
     os.remove(temp_path)
 
@@ -418,7 +498,7 @@ def save_compressed_checkpoint(model, epoch, best_loss, lr, path):
 
     return size_mb
 
-def load_compressed_checkpoint(model, path, device):
+def load_compressed_checkpoint(model, optimizer, scheduler, path, device):
     """
     Загрузка с автоматическим восстановлением типов данных
     """
@@ -439,12 +519,10 @@ def load_compressed_checkpoint(model, path, device):
                 current_param = current_weights[name]
 
                 if saved_param.is_floating_point() and current_param.is_floating_point():
-                    # Восстанавливаем в оригинальный dtype модели
                     loaded_weights[name] = saved_param.to(current_param.dtype)
                 else:
                     loaded_weights[name] = saved_param
             else:
-                # Если веса не найдены, оставляем как есть
                 loaded_weights[name] = current_weights[name]
                 print(f"⚠️  Пропущен параметр: {name}")
 
@@ -452,16 +530,24 @@ def load_compressed_checkpoint(model, path, device):
         model.load_state_dict(loaded_weights)
         model.to(device)
 
+        # 5. Восстанавливаем optimizer и scheduler
+        if optimizer and 'optimizer_state_dict' in checkpoint and checkpoint['optimizer_state_dict']:
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+
+        if scheduler and 'scheduler_state_dict' in checkpoint and checkpoint['scheduler_state_dict']:
+            if hasattr(scheduler, 'load_state_dict'):
+                scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            else:
+                print("⚠️  Scheduler не поддерживает load_state_dict")
+
         print(f"✓ Чекпоинт загружен")
         print(f"  Эпоха: {checkpoint['epoch']}")
-        print(f"  Best loss: {checkpoint['best_loss']:.4f}")
-        print(f"  LR: {checkpoint['learning_rate']:.6f}")
 
         return {
             'model': model,
             'epoch': checkpoint['epoch'],
-            'best_loss': checkpoint['best_loss'],
-            'learning_rate': checkpoint['learning_rate'],
+            'optimizer': optimizer,
+            'scheduler': scheduler,
         }
 
     except Exception as e:
@@ -471,11 +557,12 @@ def load_compressed_checkpoint(model, path, device):
         return None
 
 def run_training():
-    # Оптимизация матричных операций (НОВОЕ)
+    # Оптимизация матричных операций
     torch.set_float32_matmul_precision('medium')
 
     # Включение оптимизации cuDNN
     torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.deterministic = False
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     os.makedirs(os.path.dirname(config.checkpoint_path), exist_ok=True)
@@ -487,10 +574,15 @@ def run_training():
         f.write('\n'.join(full_classes))
 
     print(f"📊 Количество классов: {len(full_classes)}")
+    print(f"🚀 Конфигурация обучения:")
+    print(f"  • Ini LR: {config.ini_lr:.4f}")
+    print(f"  • Max LR: {config.max_lr:.4f}")
+    print(f"  • Warmup эпох: {config.warmup_epochs}")
+    print(f"  • Всего эпох: {config.epochs}")
 
     # Создаем датасет с фиксированным порядком классов
     full_dataset = ImageDataset(config.source_dir)
-    full_dataset.classes = full_classes  # Переопределяем порядок
+    full_dataset.classes = full_classes
 
     train_size = int((1 - config.val_split) * len(full_dataset))
     train_ds, val_ds = torch.utils.data.random_split(full_dataset, [train_size, len(full_dataset) - train_size])
@@ -499,141 +591,117 @@ def run_training():
         train_ds,
         batch_size=config.batch_size,
         shuffle=True,
-        num_workers=os.cpu_count(),
+        num_workers=4,  # Уменьшили для стабильности
         persistent_workers=True,
-        prefetch_factor=2,
+        prefetch_factor=3,
         pin_memory=True)
     val_loader = DataLoader(
         val_ds,
         batch_size=config.batch_size,
-        num_workers=os.cpu_count(),
+        num_workers=4,
         persistent_workers=True,
-        prefetch_factor=2,
+        prefetch_factor=3,
         pin_memory=True)
 
     model = AnimeClassifier(len(full_classes)).to(device)
 
     class_weights = get_class_weights_from_dirs(config.source_dir, full_classes).to(device)
 
-    optimizer = optim.AdamW(model.parameters(), lr=config.lr)
-    plateau_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode='min',
-        factor=config.factor_lr,
-        patience=config.patience_lr,
-        threshold=config.threshold, # ← игнорирует минимальные изменения
-        threshold_mode='rel',       # ← относительное сравнение
+    optimizer = optim.AdamW(model.parameters(), lr=config.ini_lr)
+
+    scheduler = WarmupReduceLROnPlateau(
+        optimizer=optimizer,
+        warmup_epochs=config.warmup_epochs,
+        ini_lr=config.ini_lr,
+        max_lr=config.max_lr,
+        patience=config.plateau_patience,
+        factor=config.plateau_factor,
+        threshold=config.plateau_threshold,
     )
+
     scaler = torch.amp.GradScaler('cuda', enabled=config.mixed_precision and torch.cuda.is_available())
-    start_epoch = 0
-    best_loss = float('inf')
+    start_epoch = 1
     early_stop_counter = 0
 
     if config.resume_training:
-        # Просто загружаем сжатый чекпоинт
-        loaded = load_compressed_checkpoint(model, config.checkpoint_path, device)
+        loaded = load_compressed_checkpoint(model, optimizer, scheduler, config.checkpoint_path, device)
 
         if loaded is not None:
-            # Получаем модель из чекпоинта
             model = loaded['model']
-
-            # Создаем оптимизатор с сохраненным LR
-            optimizer = optim.AdamW(model.parameters(), lr=loaded['learning_rate'])
-
-            # Восстанавливаем состояние обучения
+            optimizer = loaded['optimizer']
+            scheduler = loaded['scheduler']
             start_epoch = loaded['epoch'] + 1
-            best_loss = loaded['best_loss']
-
-            # Создаем scheduler и scaler
-            plateau_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                optimizer,
-                mode='min',
-                factor=config.factor_lr,
-                patience=config.patience_lr,
-                threshold=config.threshold,
-                threshold_mode='rel',
-            )
-            scaler = torch.amp.GradScaler('cuda', enabled=config.mixed_precision and torch.cuda.is_available())
 
             # Компиляция модели
             compile_model(model)
 
-            print(f"🔄 Продолжение обучения с эпохи {start_epoch}, LR={loaded['learning_rate']:.6f}")
+            print(f"🔄 Продолжение обучения с эпохи {start_epoch}")
+            print(f"  Текущий LR: {optimizer.param_groups[0]['lr']:.6f}")
         else:
-            # Если не удалось загрузить, начинаем с нуля
             print("❌ Не удалось загрузить чекпоинт, начинаем обучение с нуля")
-
-            # Оптимизация модели при первом запуске
             compile_model(model)
-
-            # Сохраняем начальный сжатый чекпоинт
             save_compressed_checkpoint(
                 model=model,
                 epoch=-1,
-                best_loss=float('inf'),
-                lr=config.lr,
+                optimizer=optimizer,
+                scheduler=scheduler,
                 path=config.checkpoint_path
             )
             print("[System]  Initial compressed checkpoint saved")
     else:
-        # Оптимизация модели при первом запуске
         compile_model(model)
-
-        # Сохраняем начальный сжатый чекпоинт
         save_compressed_checkpoint(
             model=model,
             epoch=-1,
-            best_loss=float('inf'),
-            lr=config.lr,
+            optimizer=optimizer,
+            scheduler=scheduler,
             path=config.checkpoint_path
         )
         print("[System]  Initial compressed checkpoint saved")
 
-    summary(model, input_size=(1, 3, 224, 224))
-
-    start_time = time.time()  # Засекаем время начала
-    optimizer.zero_grad(set_to_none=True)  # Инициализация градиентов
+    start_time = time.time()
     train_loader_len = len(train_loader)
     val_loader_len = len(val_loader)
-    for epoch in range(start_epoch, config.epochs):
+
+    for epoch in range(start_epoch, config.epochs+1):
         model.train()
         train_loss = 0.0
         train_correct, train_total = 0, 0
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
+        epoch_start_time = time.time()
 
-        epoch_start_time = time.time()  # Время начала эпохи
+        current_lr = scheduler.get_last_lr()
+        print(f"[LR] Current: {current_lr:.8f}")
+
         for batch_idx, (inputs, labels) in enumerate(train_loader):
-            batch_start_time = time.time()  # Время начала обработки батча
+            batch_start_time = time.time()
             inputs, labels = inputs.to(device), labels.to(device)
 
             outputs, loss = forward_with_mixup_cutmix(model, inputs, labels, config, class_weights, device)
-            # Накопление градиентов (основное изменение)
+
             scaler.scale(loss).backward()
             train_loss += loss.item()
 
             # Градиентный клиппинг
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.gradient_clip)
 
-            # Шаг оптимизатора
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
 
-            # Расчет метрик только при обновлении
             _, predicted = torch.max(outputs, 1)
             current_batch_size = labels.size(0)
             train_total += current_batch_size
             train_correct += (predicted == labels).sum().item()
 
-            # Расчет времени для логирования
             batch_duration = time.time() - batch_start_time
             remaining_batches = train_loader_len - (batch_idx + 1)
             estimated_remaining_time = remaining_batches * batch_duration * 3
 
             remaining_time_str = time.strftime('%H:%M:%S', time.gmtime(estimated_remaining_time))
             print(
-                f"\r[Train] Epoch {epoch+1}/{config.epochs} | Batch {batch_idx+1}/{train_loader_len} | "
+                f"\r[Train] Epoch {epoch}/{config.epochs} | Batch {batch_idx+1}/{train_loader_len} | "
                 f"Loss: {(loss.item()):.4f} | Remaining time: {remaining_time_str}",
                 end='', flush=True)
 
@@ -662,23 +730,17 @@ def run_training():
                 all_preds.extend(predicted.cpu().numpy())
                 all_labels.extend(labels.cpu().numpy())
 
-                # Расчет оставшегося времени
                 batch_duration = time.time() - batch_start_time
                 remaining_batches = val_loader_len - (batch_idx + 1)
                 estimated_remaining_time = remaining_batches * batch_duration * 3
                 remaining_time_str = time.strftime('%H:%M:%S', time.gmtime(estimated_remaining_time))
 
                 print(
-                    f"\r[Val]   Epoch {epoch+1}/{config.epochs} | Batch {batch_idx+1}/{val_loader_len} | "
+                    f"\r[Val]   Epoch {epoch}/{config.epochs} | Batch {batch_idx+1}/{val_loader_len} | "
                     f"Loss: {loss.item():.4f} | Remaining: {remaining_time_str}",
                     end='', flush=True)
 
         print()
-
-        current_lr = optimizer.param_groups[0]['lr']
-        # Уменьшение скорости обучения
-        plateau_scheduler.step(val_loss)
-        next_lr = optimizer.param_groups[0]['lr']
 
         # Расчет метрик
         val_accuracy = 100 * val_correct / val_total
@@ -686,53 +748,61 @@ def run_training():
         val_recall = recall_score(all_labels, all_preds, average='macro', zero_division=0)
         val_f1 = f1_score(all_labels, all_preds, average='macro', zero_division=0)
 
-        epoch_end_time = time.time()  # Время окончания эпохи
+        epoch_end_time = time.time()
         epoch_duration = epoch_end_time - epoch_start_time
         total_elapsed_time = epoch_end_time - start_time
         epoch_duration_str = time.strftime("%H:%M:%S", time.gmtime(epoch_duration))
         total_elapsed_str = time.strftime("%H:%M:%S", time.gmtime(total_elapsed_time))
 
-        # Логирование
-        print(f"[Summary] Train Loss: {train_loss/len(train_loader):.4f} | Acc: {train_accuracy:.2f}%")
-        print(f"[Summary] Val   Loss: {val_loss/len(val_loader):.4f} | Acc: {val_accuracy:.2f}%")
-        print(f"[Summary] Val Precision: {val_precision:.4f} | Recall: {val_recall:.4f} | F1: {val_f1:.4f}")
-        print(f"[Time]    Epoch: {epoch_duration_str} | Total: {total_elapsed_str}")
-        print(f"[Summary] LR: {current_lr:.10f}")
-        print(f"[Summary] Next LR: {next_lr:.10f}")
-
-        # Ранняя остановка
-        if val_loss < best_loss:
-            best_loss = val_loss
+        # Ранняя остановка и сохранение чекпоинта
+        if val_loss < scheduler.best_loss or epoch <= config.warmup_epochs:
             early_stop_counter = 0
-            current_lr = optimizer.param_groups[0]['lr']
             save_compressed_checkpoint(
                 model=model,
                 epoch=epoch,
-                best_loss=best_loss,
-                lr=current_lr,
+                optimizer=optimizer,
+                scheduler=scheduler,
                 path=config.checkpoint_path
             )
             print("[System]  Checkpoint saved (compressed)")
         else:
             early_stop_counter += 1
             if early_stop_counter >= config.early_stopping_patience:
-                print("[System]  Early Stop")
+                print(f"[System]  Early Stop (no improvement for {early_stop_counter} epochs)")
                 break
+
+        next_lr = scheduler.step(epoch+1, val_loss)
+
+        # Логирование
+        print(f"[Summary] Train Loss: {train_loss/len(train_loader):.4f} | Acc: {train_accuracy:.2f}%")
+        print(f"[Summary] Val   Loss: {val_loss/len(val_loader):.4f} | Acc: {val_accuracy:.2f}%")
+        print(f"[Summary] Val Precision: {val_precision:.4f} | Recall: {val_recall:.4f} | F1: {val_f1:.4f}")
+        print(f"[Time]    Epoch: {epoch_duration_str} | Total: {total_elapsed_str}")
+        print(f"[LR]      Current: {current_lr:.8f}")
+        print(f"[LR]      Next:    {next_lr:.8f}")
+
         print()
 
 # ====================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ======================
 def convert_to_onnx():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    # Загружаем классы
     with open(config.labels_path) as f:
         classes = [line.strip() for line in f]
 
-    # Создаем модель
     model = AnimeClassifier(len(classes)).to(device)
+    optimizer = optim.AdamW(model.parameters(), lr=config.ini_lr)
+    scheduler = WarmupReduceLROnPlateau(
+        optimizer=optimizer,
+        warmup_epochs=config.warmup_epochs,
+        ini_lr=config.ini_lr,
+        max_lr=config.max_lr,
+        patience=config.plateau_patience,
+        factor=config.plateau_factor,
+        threshold=config.plateau_threshold,
+    )
 
-    # Загружаем сжатый чекпоинт
-    loaded = load_compressed_checkpoint(model, config.checkpoint_path, device)
+    loaded = load_compressed_checkpoint(model, optimizer, scheduler, config.checkpoint_path, device)
 
     if loaded is None:
         print("❌ Не удалось загрузить чекпоинт для конвертации в ONNX!")
@@ -741,17 +811,9 @@ def convert_to_onnx():
     model = loaded['model']
     model.eval()
 
-    # Удаляем префикс _orig_mod. если модель была скомпилирована
-    model_state_dict = model.state_dict()
-    if any('_orig_mod.' in key for key in model_state_dict.keys()):
-        # Если модель была скомпилирована, нужно ее декомпилировать
-        model = torch._dynamo.run(model)
-
     print(f"✅ Модель загружена для ONNX экспорта")
     print(f"   Классов: {len(classes)}")
-    print(f"   Устройство: {device}")
 
-    # Экспорт в ONNX
     dummy_input = torch.randn(1, 3, *config.input_size).to(device)
 
     try:
@@ -763,13 +825,12 @@ def convert_to_onnx():
             output_names=['output'],
             dynamic_axes={'input': {0: 'batch_size'}, 'output': {0: 'batch_size'}},
             do_constant_folding=True,
-            opset_version=14,  # Используем более новую версию
+            opset_version=14,
             training=torch.onnx.TrainingMode.EVAL,
             verbose=False
         )
         print(f"✅ ONNX модель сохранена: {config.onnx_path}")
 
-        # Проверяем размер файла
         if os.path.exists(config.onnx_path):
             size_mb = os.path.getsize(config.onnx_path) / 1024 / 1024
             print(f"   Размер ONNX файла: {size_mb:.2f} MB")
@@ -785,13 +846,10 @@ def test_onnx():
         print(f"   Путь: {config.onnx_path}")
         return
 
-    # Загрузка ONNX-модели
     try:
-        # Настраиваем сессию ONNX Runtime
         options = ort.SessionOptions()
         options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
 
-        # Используем доступные провайдеры
         providers = ['CUDAExecutionProvider', 'CPUExecutionProvider'] if torch.cuda.is_available() else ['CPUExecutionProvider']
 
         session = ort.InferenceSession(config.onnx_path, options, providers=providers)
@@ -800,7 +858,6 @@ def test_onnx():
         print(f"❌ Ошибка загрузки ONNX модели: {e}")
         return
 
-    # Загружаем тестовое изображение
     test_image_path = os.path.join(config.dir, "test.jpg")
     if not os.path.exists(test_image_path):
         print(f"❌ Тестовое изображение не найдено: {test_image_path}")
@@ -811,7 +868,6 @@ def test_onnx():
         img = Image.open(test_image_path).convert('RGB')
         img_np = np.array(img)
 
-        # Применение преобразований
         transform = ImageDataset._get_transforms('val')
         augmented = transform(image=img_np)
         img_tensor = augmented['image'].unsqueeze(0)
@@ -821,16 +877,24 @@ def test_onnx():
         print(f"❌ Ошибка загрузки изображения: {e}")
         return
 
-    # ====================== PyTorch предсказание ======================
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    # Загружаем классы
     with open(config.labels_path) as f:
         classes = [line.strip() for line in f]
 
-    # Инициализация и загрузка PyTorch-модели
     model = AnimeClassifier(len(classes)).to(device)
-    loaded = load_compressed_checkpoint(model, config.checkpoint_path, device)
+    optimizer = optim.AdamW(model.parameters(), lr=config.ini_lr)
+    scheduler = WarmupReduceLROnPlateau(
+        optimizer=optimizer,
+        warmup_epochs=config.warmup_epochs,
+        ini_lr=config.ini_lr,
+        max_lr=config.max_lr,
+        patience=config.plateau_patience,
+        factor=config.plateau_factor,
+        threshold=config.plateau_threshold,
+    )
+
+    loaded = load_compressed_checkpoint(model, optimizer, scheduler, config.checkpoint_path, device)
 
     if loaded is None:
         print("❌ Не удалось загрузить PyTorch модель для сравнения!")
@@ -839,17 +903,12 @@ def test_onnx():
     model = loaded['model']
     model.eval()
 
-    # Предсказание PyTorch
     with torch.no_grad():
         pytorch_output = model(img_tensor.to(device))
         pytorch_probs = torch.softmax(pytorch_output, dim=1).cpu()
 
-    # ====================== ONNX предсказание ======================
     try:
-        # Подготавливаем входные данные для ONNX
         onnx_input = img_tensor.numpy().astype(np.float32)
-
-        # Запускаем inference
         onnx_outputs = session.run(None, {'input': onnx_input})
         onnx_probs = torch.softmax(torch.tensor(onnx_outputs[0]), dim=1)
 
@@ -858,22 +917,17 @@ def test_onnx():
         print(f"❌ Ошибка ONNX inference: {e}")
         return
 
-    # ====================== Вывод результатов ======================
-
-    # Результаты PyTorch
     print("\n" + "="*50)
     print("[PyTorch] Топ-5 предсказаний:")
     pytorch_top_probs, pytorch_top_indices = torch.topk(pytorch_probs, 5)
     for i, (prob, idx) in enumerate(zip(pytorch_top_probs[0], pytorch_top_indices[0])):
         print(f"{i+1}. {classes[idx]}: {prob.item()*100:.2f}%")
 
-    # Результаты ONNX
     print("\n[ONNX] Топ-5 предсказаний:")
     onnx_top_probs, onnx_top_indices = torch.topk(onnx_probs, 5)
     for i, (prob, idx) in enumerate(zip(onnx_top_probs[0], onnx_top_indices[0])):
         print(f"{i+1}. {classes[idx]}: {prob.item()*100:.2f}%")
 
-    # Проверка совпадения результатов
     diff = torch.max(torch.abs(pytorch_probs - onnx_probs)).item()
     print(f"\n[Сравнение] Расхождение между выходами: {diff:.6f}")
 
@@ -884,26 +938,22 @@ def test_onnx():
     else:
         print("❌ Большое расхождение (> 0.01)! Возможная ошибка конвертации")
 
-    # Дополнительная информация
     print("\n" + "="*50)
     print(f"PyTorch device: {device}")
     print(f"PyTorch dtype: {pytorch_probs.dtype}")
     print(f"ONNX dtype: {onnx_probs.dtype}")
     print(f"Количество классов: {len(classes)}")
 
-def get_classes():
-  with open(config.labels_path) as f:
-      return [line.strip() for line in f]
-
 # ====================== ИНТЕРФЕЙС ======================
 def main_menu():
     while True:
-        print("\nМеню:")
-        print("1. Обучить модель")
-        print("2. Продолжить обучение")  # Новая опция
+        print("\n" + "="*50)
+        print("🚀 Anime Classifier")
+        print("="*50)
+        print("1. Обучить модель (с нуля)")
+        print("2. Продолжить обучение")
         print("3. Конвертировать в ONNX")
         print("4. Протестировать ONNX")
-        print("0. Выход")
         choice = input("Выбор: ").strip()
 
         if choice == '1':
