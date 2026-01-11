@@ -131,9 +131,11 @@ class WarmupReduceLROnPlateau():
     def _reduce_lr(self):
         """Уменьшение LR для всех групп параметров"""
         self.num_reduced += 1
+        factor = self.factor**self.num_reduced
+        print(f"[LR]    Factor:    {factor:.8f}")
         for param_group in self.optimizer.param_groups:
             old_lr = param_group['lr']
-            new_lr = old_lr * (self.factor**self.num_reduced)
+            new_lr = old_lr * factor
             param_group['lr'] = new_lr
 
 
