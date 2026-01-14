@@ -53,7 +53,7 @@ class Config:
     warmup_epochs = 4               # Количество эпох для прогрева LR
     plateau_patience = 1            # Ждать эпохи без улучшения
     plateau_factor = 0.75           # Уменьшать lr
-    plateau_threshold = 0.0001      # Порог улучшения (относительный)
+    plateau_threshold = 0.01        # Порог улучшения (относительный)
     early_stopping_patience = 5     # Количество эпох без улучшения для ранней остановки
 
 config = Config()
