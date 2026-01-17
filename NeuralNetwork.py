@@ -300,7 +300,7 @@ class ImageDataset(Dataset):
             augmented = self.transform(image=img)
             img = augmented['image']
 
-        return img, label  # Просто возвращаем тензор
+        return img, label  
 
     @staticmethod
     def _get_transforms(mode):
