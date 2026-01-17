@@ -82,18 +82,17 @@ class WarmupReduceLROnPlateau():
         else:
             self.current_epoch += 1
 
-        if self.current_epoch == 1:
-            for param_group in self.optimizer.param_groups:
-                param_group['lr'] = self.ini_lr
-            self.best_loss = validation_loss
-            return self.optimizer.param_groups[0]['lr']
 
         # Warmup фаза
-        if self.current_epoch == 2:
-            factor = self.max_lr / self.ini_lr
-            self._change_lr(factor)
-            self.best_loss = validation_loss
-            return self.optimizer.param_groups[0]['lr']
+        if self.current_epoch < 3:
+            if self.current_epoch == 1:
+                lr = self.ini_lr
+            else
+                lr = self.max_lr
+            for param_group in self.optimizer.param_groups:
+                param_group['lr'] = lr
+          self.best_loss = validation_loss
+          return self.optimizer.param_groups[0]['lr']
 
         if self._is_better(validation_loss, self.best_loss):
             self.best_loss = validation_loss
@@ -113,9 +112,6 @@ class WarmupReduceLROnPlateau():
         self.num_reduced += 1
         factor = self.factor**self.num_reduced
         print(f"[LR]    Factor:    {factor:.8f}")
-        self._change_lr(factor)
-
-    def _change_lr(self, factor):
         for param_group in self.optimizer.param_groups:
             old_lr = param_group['lr']
             new_lr = old_lr * factor
