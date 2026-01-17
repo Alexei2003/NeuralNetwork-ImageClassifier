@@ -82,7 +82,6 @@ class WarmupReduceLROnPlateau():
         else:
             self.current_epoch += 1
 
-
         # Warmup фаза
         if self.current_epoch < 3:
             if self.current_epoch == 1:
