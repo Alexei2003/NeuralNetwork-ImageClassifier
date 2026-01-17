@@ -41,7 +41,7 @@ class Config:
     # Параметры обучения
     val_split = 0.2                 # Доля данных, выделяемая под валидацию
     gradient_clip = 1.0             # Максимальная норма градиента
-    batch_size = 256                # Размер батча (число примеров, обрабатываемых за один проход)
+    batch_size = 512                # Размер батча (число примеров, обрабатываемых за один проход)
     epochs = 100                    # Количество эпох обучения (полных проходов по всему датасету)
     focal_gamma = 5                 # Параметр гамма для Focal Loss, регулирует степень фокусировки на сложных примерах
     smoothing = 0.1                 # Параметр label smoothing, задаёт уровень сглаживания меток для улучшения обобщения
@@ -86,12 +86,12 @@ class WarmupReduceLROnPlateau():
         if self.current_epoch < 3:
             if self.current_epoch == 1:
                 lr = self.ini_lr
-            else
+            else:
                 lr = self.max_lr
             for param_group in self.optimizer.param_groups:
                 param_group['lr'] = lr
-          self.best_loss = validation_loss
-          return self.optimizer.param_groups[0]['lr']
+            self.best_loss = validation_loss
+            return self.optimizer.param_groups[0]['lr']
 
         if self._is_better(validation_loss, self.best_loss):
             self.best_loss = validation_loss
@@ -294,13 +294,13 @@ class ImageDataset(Dataset):
 
     def __getitem__(self, idx):
         img_path, label = self.samples[idx]
-        img = np.array(Image.open(img_path).convert('RGB'))  # Конвертация в numpy array
+        img = np.array(Image.open(img_path).convert('RGB'))
 
         if self.transform:
             augmented = self.transform(image=img)
             img = augmented['image']
 
-        return img, label
+        return img, label  # Просто возвращаем тензор
 
     @staticmethod
     def _get_transforms(mode):
@@ -372,6 +372,7 @@ def cutmix_data(x, y, alpha=1.0):
     y_a, y_b = y, y[index]
     lam = 1 - ((x2 - x1) * (y2 - y1) / (w * h))
     return x, y_a, y_b, lam
+
 
 def get_class_weights_from_dirs(root_dir, class_names):
     class_counts = []
@@ -567,16 +568,16 @@ def run_training():
         train_ds,
         batch_size=config.batch_size,
         shuffle=True,
-        num_workers=os.cpu_count()-1,  
+        num_workers=4,
         persistent_workers=True,
-        prefetch_factor=1,
+        prefetch_factor=4,
         pin_memory=True)
     val_loader = DataLoader(
         val_ds,
         batch_size=config.batch_size,
-        num_workers=os.cpu_count()-1,
+        num_workers=4,
         persistent_workers=True,
-        prefetch_factor=1,
+        prefetch_factor=4,
         pin_memory=True)
 
     model = AnimeClassifier(len(full_classes)).to(device)
@@ -647,8 +648,8 @@ def run_training():
         current_lr = scheduler.get_last_lr()
         print(f"[LR] Current: {current_lr:.8f}")
 
+        batch_start_time = time.time()
         for batch_idx, (inputs, labels) in enumerate(train_loader):
-            batch_start_time = time.time()
             inputs, labels = inputs.to(device), labels.to(device)
 
             outputs, loss = forward_with_mixup_cutmix(model, inputs, labels, config, class_weights, device)
@@ -669,11 +670,11 @@ def run_training():
             train_total += current_batch_size
             train_correct += (predicted == labels).sum().item()
 
-            batch_duration = time.time() - batch_start_time
+            batch_duration = (time.time() - batch_start_time) / (batch_idx + 1)
             remaining_batches = train_loader_len - (batch_idx + 1)
-            estimated_remaining_time = remaining_batches * batch_duration * 3
-
+            estimated_remaining_time = remaining_batches * batch_duration
             remaining_time_str = time.strftime('%H:%M:%S', time.gmtime(estimated_remaining_time))
+
             print(
                 f"\r[Train] Epoch {epoch}/{config.epochs} | Batch {batch_idx+1}/{train_loader_len} | "
                 f"Loss: {(loss.item()):.4f} | Remaining time: {remaining_time_str}",
@@ -687,10 +688,9 @@ def run_training():
         val_loss, val_correct, val_total = 0.0, 0, 0
         all_preds, all_labels = [], []
 
+        batch_start_time = time.time()
         with torch.inference_mode(), torch.amp.autocast('cuda', enabled=config.mixed_precision):
             for batch_idx, (inputs, labels) in enumerate(val_loader):
-                batch_start_time = time.time()
-
                 inputs, labels = inputs.to(device), labels.to(device)
                 outputs = model(inputs)
 
@@ -704,9 +704,9 @@ def run_training():
                 all_preds.extend(predicted.cpu().numpy())
                 all_labels.extend(labels.cpu().numpy())
 
-                batch_duration = time.time() - batch_start_time
+                batch_duration = (time.time() - batch_start_time) / (batch_idx + 1)
                 remaining_batches = val_loader_len - (batch_idx + 1)
-                estimated_remaining_time = remaining_batches * batch_duration * 3
+                estimated_remaining_time = remaining_batches * batch_duration
                 remaining_time_str = time.strftime('%H:%M:%S', time.gmtime(estimated_remaining_time))
 
                 print(
@@ -748,8 +748,8 @@ def run_training():
         next_lr = scheduler.step(epoch+1, val_loss)
 
         # Логирование
-        print(f"[Summary] Train Loss: {train_loss/len(train_loader):.4f} | Acc: {train_accuracy:.2f}%")
-        print(f"[Summary] Val   Loss: {val_loss/len(val_loader):.4f} | Acc: {val_accuracy:.2f}%")
+        print(f"[Summary] Train Loss: {train_loss/train_loader_len:.4f} | Acc: {train_accuracy:.2f}%")
+        print(f"[Summary] Val   Loss: {val_loss/val_loader_len:.4f} | Acc: {val_accuracy:.2f}%")
         print(f"[Summary] Val Precision: {val_precision:.4f} | Recall: {val_recall:.4f} | F1: {val_f1:.4f}")
         print(f"[Time]    Epoch: {epoch_duration_str} | Total: {total_elapsed_str}")
         print(f"[LR]      Current: {current_lr:.8f}")
