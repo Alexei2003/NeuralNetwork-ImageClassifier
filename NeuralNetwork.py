@@ -48,11 +48,9 @@ class Config:
     mixed_precision = True          # Использовать смешанную точность (fp16) для ускорения обучения
 
     # Параметры LR
-    max_lr = 0.01                   # Максимальная скорость обучения (learning rate)
+    max_lr = 0.005                  # Максимальная скорость обучения (learning rate)
     ini_lr = 0.001                  # Начальная скорость обучения
-    warmup_epochs = 4               # Количество эпох для прогрева LR
-    plateau_patience = 1            # Ждать эпохи без улучшения
-    plateau_factor = 0.75           # Уменьшать lr
+    plateau_factor = 0.9            # Уменьшать lr
     plateau_threshold = 0.01        # Порог улучшения (относительный)
     early_stopping_patience = 5     # Количество эпох без улучшения для ранней остановки
 
@@ -62,22 +60,20 @@ config = Config()
 class WarmupReduceLROnPlateau():
     """Warmup + ReduceLROnPlateau логика"""
 
-    def __init__(self, optimizer, warmup_epochs, ini_lr, max_lr, patience, factor, threshold):
+    def __init__(self, optimizer, ini_lr, max_lr, factor, threshold):
         self.optimizer = optimizer
-        self.warmup_epochs = warmup_epochs
-        self.ini_lr = ini_lr
+
         self.max_lr = max_lr
+        self.ini_lr = ini_lr
         self.current_epoch = 0
 
         # ReduceLROnPlateau параметры
-        self.patience = patience
         self.factor = factor
         self.threshold = threshold
         self.num_reduced = 0
 
         # Трекинг лучшего loss
         self.best_loss = float('inf')
-        self.num_bad_epochs = 0
 
     def step(self, epoch=None, validation_loss=None):
         """Вызывается в конце каждой эпохи с validation_loss"""
@@ -86,40 +82,24 @@ class WarmupReduceLROnPlateau():
         else:
             self.current_epoch += 1
 
-        # Warmup фаза
-        if self.current_epoch <= self.warmup_epochs:
-            if self.current_epoch == 1:
-                lr = self.ini_lr
-            else:
-                lr = self.max_lr * (self.current_epoch / self.warmup_epochs)
-
-            # Устанавливаем LR
+        if self.current_epoch == 1:
             for param_group in self.optimizer.param_groups:
-                param_group['lr'] = lr
-
-            self.best_loss = validation_loss  # Сбрасываем best loss в warmup
-            print(f"[Warmup {self.current_epoch-1}/{self.warmup_epochs}]")
-            return lr
-
-        # Если validation_loss не передан, просто продолжаем текущий LR
-        if validation_loss is None:
+                param_group['lr'] = self.ini_lr
+            self.best_loss = validation_loss
             return self.optimizer.param_groups[0]['lr']
 
-        # ReduceLROnPlateau логика
-        current_lr = self.optimizer.param_groups[0]['lr']
+        # Warmup фаза
+        if self.current_epoch == 2:
+            factor = self.max_lr / self.ini_lr
+            self._change_lr(factor)
+            self.best_loss = validation_loss
+            return self.optimizer.param_groups[0]['lr']
 
         if self._is_better(validation_loss, self.best_loss):
             self.best_loss = validation_loss
-            self.num_bad_epochs = 0
-            print(f"✓ Улучшение! Loss новый LR: {current_lr:.6f}")
+            print(f"✓ Улучшение!")
         else:
-            self.num_bad_epochs += 1
-            print(f"⚠️  Плохих эпох: {self.num_bad_epochs}/{self.patience}")
-
-        # Проверяем, нужно ли уменьшать LR
-        if self.num_bad_epochs > self.patience:
             self._reduce_lr()
-            self.num_bad_epochs = 0
             print(f"📉 Уменьшение LR! Новый LR: {self.optimizer.param_groups[0]['lr']:.6f}")
 
         return self.optimizer.param_groups[0]['lr']
@@ -133,11 +113,13 @@ class WarmupReduceLROnPlateau():
         self.num_reduced += 1
         factor = self.factor**self.num_reduced
         print(f"[LR]    Factor:    {factor:.8f}")
+        self._change_lr(factor)
+
+    def _change_lr(self, factor):
         for param_group in self.optimizer.param_groups:
             old_lr = param_group['lr']
             new_lr = old_lr * factor
             param_group['lr'] = new_lr
-
 
     def get_last_lr(self):
         return self.optimizer.param_groups[0]['lr']
@@ -145,11 +127,9 @@ class WarmupReduceLROnPlateau():
     def state_dict(self):
         return {
             'current_epoch': self.current_epoch,
-            'warmup_epochs': self.warmup_epochs,
             'ini_lr': self.ini_lr,
             'max_lr': self.max_lr,
             'best_loss': self.best_loss,
-            'patience': self.patience,
             'factor': self.factor,
             'threshold': self.threshold,
         }
@@ -458,7 +438,7 @@ def compile_model(model):
     torch.compile(model,
         mode="max-autotune",
         dynamic=False,
-        fullgraph=False)
+        fullgraph=True)
     torch.cuda.empty_cache()
 
 def save_compressed_checkpoint(model, epoch, optimizer, scheduler, path):
@@ -579,7 +559,6 @@ def run_training():
     print(f"🚀 Конфигурация обучения:")
     print(f"  • Ini LR: {config.ini_lr:.4f}")
     print(f"  • Max LR: {config.max_lr:.4f}")
-    print(f"  • Warmup эпох: {config.warmup_epochs}")
     print(f"  • Всего эпох: {config.epochs}")
 
     # Создаем датасет с фиксированным порядком классов
@@ -593,16 +572,16 @@ def run_training():
         train_ds,
         batch_size=config.batch_size,
         shuffle=True,
-        num_workers=4,  # Уменьшили для стабильности
+        num_workers=os.cpu_count()-1,  
         persistent_workers=True,
-        prefetch_factor=3,
+        prefetch_factor=1,
         pin_memory=True)
     val_loader = DataLoader(
         val_ds,
         batch_size=config.batch_size,
-        num_workers=4,
+        num_workers=os.cpu_count()-1,
         persistent_workers=True,
-        prefetch_factor=3,
+        prefetch_factor=1,
         pin_memory=True)
 
     model = AnimeClassifier(len(full_classes)).to(device)
@@ -613,10 +592,8 @@ def run_training():
 
     scheduler = WarmupReduceLROnPlateau(
         optimizer=optimizer,
-        warmup_epochs=config.warmup_epochs,
         ini_lr=config.ini_lr,
         max_lr=config.max_lr,
-        patience=config.plateau_patience,
         factor=config.plateau_factor,
         threshold=config.plateau_threshold,
     )
@@ -757,7 +734,7 @@ def run_training():
         total_elapsed_str = time.strftime("%H:%M:%S", time.gmtime(total_elapsed_time))
 
         # Ранняя остановка и сохранение чекпоинта
-        if val_loss < scheduler.best_loss or epoch <= config.warmup_epochs:
+        if val_loss < scheduler.best_loss:
             early_stop_counter = 0
             save_compressed_checkpoint(
                 model=model,
@@ -796,10 +773,8 @@ def convert_to_onnx():
     optimizer = optim.AdamW(model.parameters(), lr=config.ini_lr)
     scheduler = WarmupReduceLROnPlateau(
         optimizer=optimizer,
-        warmup_epochs=config.warmup_epochs,
         ini_lr=config.ini_lr,
         max_lr=config.max_lr,
-        patience=config.plateau_patience,
         factor=config.plateau_factor,
         threshold=config.plateau_threshold,
     )
@@ -888,10 +863,8 @@ def test_onnx():
     optimizer = optim.AdamW(model.parameters(), lr=config.ini_lr)
     scheduler = WarmupReduceLROnPlateau(
         optimizer=optimizer,
-        warmup_epochs=config.warmup_epochs,
         ini_lr=config.ini_lr,
         max_lr=config.max_lr,
-        patience=config.plateau_patience,
         factor=config.plateau_factor,
         threshold=config.plateau_threshold,
     )
