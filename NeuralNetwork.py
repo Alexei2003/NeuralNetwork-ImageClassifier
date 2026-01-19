@@ -48,10 +48,10 @@ class Config:
     mixed_precision = True          # Использовать смешанную точность (fp16) для ускорения обучения
 
     # Параметры LR
-    max_lr = 0.005                  # Максимальная скорость обучения (learning rate)
+    max_lr = 0.01                   # Максимальная скорость обучения (learning rate)
     ini_lr = 0.001                  # Начальная скорость обучения
     plateau_factor = 0.9            # Уменьшать lr
-    plateau_threshold = 0.01        # Порог улучшения (относительный)
+    plateau_threshold = 0.03        # Порог улучшения (относительный)
     early_stopping_patience = 5     # Количество эпох без улучшения для ранней остановки
 
 config = Config()
@@ -121,12 +121,15 @@ class WarmupReduceLROnPlateau():
 
     def state_dict(self):
         return {
-            'current_epoch': self.current_epoch,
-            'ini_lr': self.ini_lr,
             'max_lr': self.max_lr,
-            'best_loss': self.best_loss,
+            'ini_lr': self.ini_lr,
+            'current_epoch': self.current_epoch,
+
             'factor': self.factor,
             'threshold': self.threshold,
+            'num_reduced': self.num_reduced,
+
+            'best_loss': self.best_loss,
         }
 
     def load_state_dict(self, state_dict):
@@ -300,7 +303,7 @@ class ImageDataset(Dataset):
             augmented = self.transform(image=img)
             img = augmented['image']
 
-        return img, label  
+        return img, label
 
     @staticmethod
     def _get_transforms(mode):
@@ -568,14 +571,14 @@ def run_training():
         train_ds,
         batch_size=config.batch_size,
         shuffle=True,
-        num_workers=4,
+        num_workers=2,
         persistent_workers=True,
         prefetch_factor=4,
         pin_memory=True)
     val_loader = DataLoader(
         val_ds,
         batch_size=config.batch_size,
-        num_workers=4,
+        num_workers=2,
         persistent_workers=True,
         prefetch_factor=4,
         pin_memory=True)
@@ -650,7 +653,8 @@ def run_training():
 
         batch_start_time = time.time()
         for batch_idx, (inputs, labels) in enumerate(train_loader):
-            inputs, labels = inputs.to(device), labels.to(device)
+            inputs = inputs.to(device, non_blocking=True)  # Асинхронная передача
+            labels = labels.to(device, non_blocking=True)
 
             outputs, loss = forward_with_mixup_cutmix(model, inputs, labels, config, class_weights, device)
 
@@ -691,7 +695,9 @@ def run_training():
         batch_start_time = time.time()
         with torch.inference_mode(), torch.amp.autocast('cuda', enabled=config.mixed_precision):
             for batch_idx, (inputs, labels) in enumerate(val_loader):
-                inputs, labels = inputs.to(device), labels.to(device)
+                inputs = inputs.to(device, non_blocking=True)  # Асинхронная передача
+                labels = labels.to(device, non_blocking=True)
+
                 outputs = model(inputs)
 
                 loss = focal_loss_with_smoothing(outputs, labels, config.focal_gamma, config.smoothing)
