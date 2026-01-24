@@ -13,6 +13,7 @@ import albumentations as A
 from albumentations.pytorch import ToTensorV2
 import torch.backends.cudnn
 import gzip
+from IPython.display import Audio, display
 
 # ====================== КОНФИГУРАЦИЯ ======================
 class Config:
@@ -51,8 +52,8 @@ class Config:
     max_lr = 0.01                   # Максимальная скорость обучения (learning rate)
     ini_lr = 0.001                  # Начальная скорость обучения
     plateau_factor = 0.9            # Уменьшать lr
-    plateau_threshold = 0.03        # Порог улучшения (относительный)
-    early_stopping_patience = 5     # Количество эпох без улучшения для ранней остановки
+    plateau_threshold = 0.05        # Порог улучшения (относительный)
+    early_stopping_patience = 10    # Количество эпох без улучшения для ранней остановки
 
 config = Config()
 
@@ -70,7 +71,6 @@ class WarmupReduceLROnPlateau():
         # ReduceLROnPlateau параметры
         self.factor = factor
         self.threshold = threshold
-        self.num_reduced = 0
 
         # Трекинг лучшего loss
         self.best_loss = float('inf')
@@ -88,13 +88,15 @@ class WarmupReduceLROnPlateau():
                 lr = self.ini_lr
             else:
                 lr = self.max_lr
+
             for param_group in self.optimizer.param_groups:
                 param_group['lr'] = lr
+
             self.best_loss = validation_loss
             return self.optimizer.param_groups[0]['lr']
 
         if self._is_better(validation_loss, self.best_loss):
-            self.best_loss = validation_loss
+            self.best_loss=validation_loss
             print(f"✓ Улучшение!")
         else:
             self._reduce_lr()
@@ -108,12 +110,10 @@ class WarmupReduceLROnPlateau():
 
     def _reduce_lr(self):
         """Уменьшение LR для всех групп параметров"""
-        self.num_reduced += 1
-        factor = self.factor**self.num_reduced
-        print(f"[LR]    Factor:    {factor:.8f}")
+        self.threshold*=self.factor
         for param_group in self.optimizer.param_groups:
             old_lr = param_group['lr']
-            new_lr = old_lr * factor
+            new_lr = old_lr * self.factor
             param_group['lr'] = new_lr
 
     def get_last_lr(self):
@@ -127,7 +127,6 @@ class WarmupReduceLROnPlateau():
 
             'factor': self.factor,
             'threshold': self.threshold,
-            'num_reduced': self.num_reduced,
 
             'best_loss': self.best_loss,
         }
@@ -376,7 +375,6 @@ def cutmix_data(x, y, alpha=1.0):
     lam = 1 - ((x2 - x1) * (y2 - y1) / (w * h))
     return x, y_a, y_b, lam
 
-
 def get_class_weights_from_dirs(root_dir, class_names):
     class_counts = []
     for class_name in class_names:
@@ -537,6 +535,16 @@ def load_compressed_checkpoint(model, optimizer, scheduler, path, device):
         traceback.print_exc()
         return None
 
+def make_sound():
+    # Генерируем короткий "бип" (440 Гц, 0.2 секунды)
+    sample_rate = 44100
+    duration = 0.2  # секунды
+    t = np.linspace(0, duration, int(sample_rate * duration))
+    audio_signal = 0.3 * np.sin(2 * np.pi * 440 * t)  # 440 Гц - нота "Ля"
+
+    # Воспроизводим автоматически
+    display(Audio(audio_signal, rate=sample_rate, autoplay=True))
+
 def run_training():
     # Оптимизация матричных операций
     torch.set_float32_matmul_precision('medium')
@@ -642,6 +650,8 @@ def run_training():
     val_loader_len = len(val_loader)
 
     for epoch in range(start_epoch, config.epochs+1):
+        make_sound()
+
         model.train()
         train_loss = 0.0
         train_correct, train_total = 0, 0
