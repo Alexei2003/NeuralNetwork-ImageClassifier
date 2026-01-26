@@ -44,8 +44,8 @@ class Config:
     gradient_clip = 1.0             # Максимальная норма градиента
     batch_size = 512                # Размер батча (число примеров, обрабатываемых за один проход)
     epochs = 100                    # Количество эпох обучения (полных проходов по всему датасету)
-    focal_gamma = 5                 # Параметр гамма для Focal Loss, регулирует степень фокусировки на сложных примерах
-    smoothing = 0.1                 # Параметр label smoothing, задаёт уровень сглаживания меток для улучшения обобщения
+    focal_gamma = 2                 # Параметр гамма для Focal Loss, регулирует степень фокусировки на сложных примерах
+    smoothing = 0.2                 # Параметр label smoothing, задаёт уровень сглаживания меток для улучшения обобщения
     mixed_precision = True          # Использовать смешанную точность (fp16) для ускорения обучения
 
     # Параметры LR
@@ -388,7 +388,7 @@ def get_class_weights_from_dirs(root_dir, class_names):
     weights = weights / weights.max()  # нормализация
     return weights
 
-def focal_loss_with_smoothing(outputs, targets, gamma=5.0, smoothing=0.1, class_weights=None):
+def focal_loss_with_smoothing(outputs, targets, gamma, smoothing, class_weights=None):
     num_classes = outputs.size(1)
     confidence = 1.0 - smoothing
 
