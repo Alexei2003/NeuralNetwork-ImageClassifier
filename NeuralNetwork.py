@@ -12,19 +12,19 @@ import time
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 import torch.backends.cudnn
-import gzip
 from IPython.display import Audio, display
 
 # ====================== КОНФИГУРАЦИЯ ======================
 class Config:
     # выбор системы
-    dir = "/content/NeuralNetwork-ImageClassifier/"
+    dir_data = "/content/NeuralNetwork-ImageClassifier/DataSet/ARTS/"
+    dir_save = "/content/drive/MyDrive/Colab Notebooks/NeuralNetwork-ImageClassifier/Model/"
 
     # Пути к данным и моделям
-    source_dir = dir + "DataSet/ARTS/Original"         # Папка с исходными изображениями
-    checkpoint_path = dir + "Model/best_model.pth"     # Путь для сохранения/загрузки модели
-    labels_path = dir + "Model/labels.txt"             # Файл с метками классов
-    onnx_path = dir + "Model/model.onnx"               # Путь для экспортированной модели в ONNX формате
+    source_dir = dir_data + "Original"                     # Папка с исходными изображениями
+    checkpoint_path = dir_save + "best_model.pth"     # Путь для сохранения/загрузки модели
+    labels_path = dir_save + "labels.txt"             # Файл с метками классов
+    onnx_path = dir_save + "model.onnx"               # Путь для экспортированной модели в ONNX формате
 
     # Флаги управления обучением
     resume_training = False         # Продолжать обучение с сохраненного чекпоинта, если True
@@ -45,13 +45,14 @@ class Config:
     batch_size = 512                # Размер батча (число примеров, обрабатываемых за один проход)
     epochs = 100                    # Количество эпох обучения (полных проходов по всему датасету)
     focal_gamma = 2                 # Параметр гамма для Focal Loss, регулирует степень фокусировки на сложных примерах
-    smoothing = 0.2                 # Параметр label smoothing, задаёт уровень сглаживания меток для улучшения обобщения
+    smoothing = 0.1                 # Параметр label smoothing, задаёт уровень сглаживания меток для улучшения обобщения
     mixed_precision = True          # Использовать смешанную точность (fp16) для ускорения обучения
 
     # Параметры LR
     max_lr = 0.01                   # Максимальная скорость обучения (learning rate)
     ini_lr = 0.001                  # Начальная скорость обучения
-    plateau_factor = 0.9            # Уменьшать lr
+    plateau_factor = 0.8            # Уменьшать lr
+    plateau_factor_threshold = 0.9  # Уменьшать threshold
     plateau_threshold = 0.05        # Порог улучшения (относительный)
     early_stopping_patience = 10    # Количество эпох без улучшения для ранней остановки
 
@@ -61,7 +62,7 @@ config = Config()
 class WarmupReduceLROnPlateau():
     """Warmup + ReduceLROnPlateau логика"""
 
-    def __init__(self, optimizer, ini_lr, max_lr, factor, threshold):
+    def __init__(self, optimizer, ini_lr, max_lr, factor, factor_threshold, threshold):
         self.optimizer = optimizer
 
         self.max_lr = max_lr
@@ -71,6 +72,7 @@ class WarmupReduceLROnPlateau():
         # ReduceLROnPlateau параметры
         self.factor = factor
         self.threshold = threshold
+        self.factor_threshold = factor_threshold
 
         # Трекинг лучшего loss
         self.best_loss = float('inf')
@@ -100,7 +102,6 @@ class WarmupReduceLROnPlateau():
             print(f"✓ Улучшение!")
         else:
             self._reduce_lr()
-            print(f"📉 Уменьшение LR! Новый LR: {self.optimizer.param_groups[0]['lr']:.6f}")
 
         return self.optimizer.param_groups[0]['lr']
 
@@ -110,11 +111,13 @@ class WarmupReduceLROnPlateau():
 
     def _reduce_lr(self):
         """Уменьшение LR для всех групп параметров"""
-        self.threshold*=self.factor
+        self.threshold*=self.factor_threshold
         for param_group in self.optimizer.param_groups:
             old_lr = param_group['lr']
             new_lr = old_lr * self.factor
             param_group['lr'] = new_lr
+        print(f"📉 Уменьшение threshold! Новый threshold: {self.threshold:.6f}")
+        print(f"📉 Уменьшение LR! Новый LR: {self.optimizer.param_groups[0]['lr']:.6f}")
 
     def get_last_lr(self):
         return self.optimizer.param_groups[0]['lr']
@@ -127,6 +130,7 @@ class WarmupReduceLROnPlateau():
 
             'factor': self.factor,
             'threshold': self.threshold,
+            'factor_threshold' : self.factor_threshold
 
             'best_loss': self.best_loss,
         }
@@ -438,78 +442,40 @@ def compile_model(model):
         fullgraph=True)
     torch.cuda.empty_cache()
 
-def save_compressed_checkpoint(model, epoch, optimizer, scheduler, path):
+def save_checkpoint(model, epoch, optimizer, scheduler, path):
     """
-    Умное сжатие с учетом mixed precision
+    Сохранение чекпоинта без сжатия
     """
-    # 1. Определяем, какие веса можно сжимать
+    # 1. Создаём стандартный чекпоинт
     checkpoint = {
         'epoch': epoch,
+        'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
         'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
     }
 
-    # 2. Сжимаем ВСЕ веса в float16
-    compressed_weights = {}
-    for name, param in model.state_dict().items():
-        if param.is_floating_point():
-            compressed_weights[name] = param.half().clone()
-        else:
-            compressed_weights[name] = param
+    # 2. Сохраняем без сжатия
+    torch.save(checkpoint, path, pickle_protocol=5)  # Протокол 5 для эффективности
 
-    checkpoint['model_state_dict'] = compressed_weights
-
-    # 3. Сохраняем с максимальным сжатием
-    with gzip.open(path, 'wb', compresslevel=9) as f:
-        torch.save(checkpoint, f, pickle_protocol=4)
-
-    # 4. Показываем результат сжатия
+    # 3. Показываем размер файла
     size_mb = os.path.getsize(path) / 1024 / 1024
-    temp_path = path + '.tmp'
-    torch.save(checkpoint, temp_path)
-    uncompressed_size = os.path.getsize(temp_path) / 1024 / 1024
-    os.remove(temp_path)
-
-    compression_ratio = (1 - size_mb / uncompressed_size) * 100
-
     print(f"[System]  Чекпоинт сохранен: {size_mb:.1f} MB")
-    print(f"[System]  Сжатие: {compression_ratio:.0f}% от {uncompressed_size:.1f} MB")
 
     return size_mb
 
-def load_compressed_checkpoint(model, optimizer, scheduler, path, device):
+def load_checkpoint(model, optimizer, scheduler, path, device):
     """
-    Загрузка с автоматическим восстановлением типов данных
+    Загрузка чекпоинта
     """
     try:
-        # 1. Загружаем
-        with gzip.open(path, 'rb') as f:
-            checkpoint = torch.load(f, map_location='cpu', weights_only=False)
+        # 1. Загружаем напрямую (без gzip)
+        checkpoint = torch.load(path, map_location='cpu', weights_only=False)
 
-        # 2. Получаем сохраненные веса
-        saved_weights = checkpoint['model_state_dict']
-        current_weights = model.state_dict()
-        loaded_weights = {}
-
-        # 3. Восстанавливаем с правильными типами данных
-        for name in current_weights.keys():
-            if name in saved_weights:
-                saved_param = saved_weights[name]
-                current_param = current_weights[name]
-
-                if saved_param.is_floating_point() and current_param.is_floating_point():
-                    loaded_weights[name] = saved_param.to(current_param.dtype)
-                else:
-                    loaded_weights[name] = saved_param
-            else:
-                loaded_weights[name] = current_weights[name]
-                print(f"⚠️  Пропущен параметр: {name}")
-
-        # 4. Загружаем в модель
-        model.load_state_dict(loaded_weights)
+        # 2. Загружаем веса модели напрямую (типы сохраняются автоматически)
+        model.load_state_dict(checkpoint['model_state_dict'])
         model.to(device)
 
-        # 5. Восстанавливаем optimizer и scheduler
+        # 3. Восстанавливаем optimizer и scheduler
         if optimizer and 'optimizer_state_dict' in checkpoint and checkpoint['optimizer_state_dict']:
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
 
@@ -602,6 +568,7 @@ def run_training():
         ini_lr=config.ini_lr,
         max_lr=config.max_lr,
         factor=config.plateau_factor,
+        factor_threshold=config.plateau_factor_threshold,
         threshold=config.plateau_threshold,
     )
 
@@ -610,7 +577,7 @@ def run_training():
     early_stop_counter = 0
 
     if config.resume_training:
-        loaded = load_compressed_checkpoint(model, optimizer, scheduler, config.checkpoint_path, device)
+        loaded = load_checkpoint(model, optimizer, scheduler, config.checkpoint_path, device)
 
         if loaded is not None:
             model = loaded['model']
@@ -626,24 +593,22 @@ def run_training():
         else:
             print("❌ Не удалось загрузить чекпоинт, начинаем обучение с нуля")
             compile_model(model)
-            save_compressed_checkpoint(
+            save_checkpoint(
                 model=model,
                 epoch=-1,
                 optimizer=optimizer,
                 scheduler=scheduler,
                 path=config.checkpoint_path
             )
-            print("[System]  Initial compressed checkpoint saved")
     else:
         compile_model(model)
-        save_compressed_checkpoint(
+        save_checkpoint(
             model=model,
             epoch=-1,
             optimizer=optimizer,
             scheduler=scheduler,
             path=config.checkpoint_path
         )
-        print("[System]  Initial compressed checkpoint saved")
 
     start_time = time.time()
     train_loader_len = len(train_loader)
@@ -747,14 +712,13 @@ def run_training():
         # Ранняя остановка и сохранение чекпоинта
         if val_loss < scheduler.best_loss:
             early_stop_counter = 0
-            save_compressed_checkpoint(
+            save_checkpoint(
                 model=model,
                 epoch=epoch,
                 optimizer=optimizer,
                 scheduler=scheduler,
                 path=config.checkpoint_path
             )
-            print("[System]  Checkpoint saved (compressed)")
         else:
             early_stop_counter += 1
             if early_stop_counter >= config.early_stopping_patience:
@@ -787,10 +751,11 @@ def convert_to_onnx():
         ini_lr=config.ini_lr,
         max_lr=config.max_lr,
         factor=config.plateau_factor,
+        factor_threshold=config.plateau_factor_threshold,
         threshold=config.plateau_threshold,
     )
 
-    loaded = load_compressed_checkpoint(model, optimizer, scheduler, config.checkpoint_path, device)
+    loaded = load_checkpoint(model, optimizer, scheduler, config.checkpoint_path, device)
 
     if loaded is None:
         print("❌ Не удалось загрузить чекпоинт для конвертации в ONNX!")
@@ -846,7 +811,7 @@ def test_onnx():
         print(f"❌ Ошибка загрузки ONNX модели: {e}")
         return
 
-    test_image_path = os.path.join(config.dir, "test.jpg")
+    test_image_path = os.path.join("/content/NeuralNetwork-ImageClassifier/", "test.jpg")
     if not os.path.exists(test_image_path):
         print(f"❌ Тестовое изображение не найдено: {test_image_path}")
         print("   Создайте файл test.jpg в папке проекта")
@@ -877,10 +842,11 @@ def test_onnx():
         ini_lr=config.ini_lr,
         max_lr=config.max_lr,
         factor=config.plateau_factor,
+        factor_threshold=config.plateau_factor_threshold,
         threshold=config.plateau_threshold,
     )
 
-    loaded = load_compressed_checkpoint(model, optimizer, scheduler, config.checkpoint_path, device)
+    loaded = load_checkpoint(model, optimizer, scheduler, config.checkpoint_path, device)
 
     if loaded is None:
         print("❌ Не удалось загрузить PyTorch модель для сравнения!")
