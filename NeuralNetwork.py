@@ -33,7 +33,7 @@ class Config:
     input_size = (224, 224)         # Размер входного изображения (ширина, высота)
 
     # Архитектура модели и гиперпараметры
-    num_experts = 16                # Количество экспертов в MoE (Mixture of Experts)
+    num_experts = 32                # Количество экспертов в MoE (Mixture of Experts)
     expert_units = 1024             # Количество нейронов в каждом эксперте
     k_top_expert = 4                # Количество активных экспертов на один пример
     se_reduction = 16               # Коэффициент редукции для SE (Squeeze-and-Excitation) блока
@@ -157,11 +157,10 @@ class MoE(nn.Module):
         self.k_top = k_top
         self.experts = nn.ModuleList()
 
-        # Создаем список размеров экспертов от 0.5 до 1.5 от базового
         expert_sizes = []
         for i in range(num_experts):
-            # Линейная интерполяция от 0.5 до 1.5
-            scale = 0.5 + (i / (num_experts - 1)) if num_experts > 1 else 1.0
+            # От 0.25 до 1.75 с квадратичным распределением
+            scale = 0.25 + (i**2 / (num_experts-1)**2) * 1.5
             size = int(base_expert_units * scale)
             expert_sizes.append(size)
 
@@ -177,7 +176,15 @@ class MoE(nn.Module):
                 nn.BatchNorm1d(input_dim)
             ))
 
-        self.router = nn.Linear(input_dim, num_experts)
+        self.router = nn.Sequential(
+            nn.Linear(input_dim, input_dim * 2),  # Увеличиваем мощность
+            nn.LayerNorm(input_dim * 2),
+            nn.GELU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(input_dim * 2, num_experts * 2),  # Промежуточный слой
+            nn.GELU(),
+            nn.Linear(num_experts * 2, num_experts)  # Финальная проекция
+        )
 
     def forward(self, x):
         logits = self.router(x)
