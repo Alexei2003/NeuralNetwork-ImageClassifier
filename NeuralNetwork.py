@@ -33,27 +33,28 @@ class Config:
     input_size = (224, 224)         # Размер входного изображения (ширина, высота)
 
     # Архитектура модели и гиперпараметры
-    num_experts = 32                # Количество экспертов в MoE (Mixture of Experts)
+    depth = 4                       # Количество ResidualBlock
     expert_units = 1024             # Количество нейронов в каждом эксперте
-    k_top_expert = 4                # Количество активных экспертов на один пример
+    num_experts = 8                 # Количество экспертов в MoE (Mixture of Experts)
+    k_top_expert = 2                # Количество активных экспертов на один пример
     se_reduction = 16               # Коэффициент редукции для SE (Squeeze-and-Excitation) блока
     dropout = 0.5                   # Вероятность отключения нейронов (dropout)
 
     # Параметры обучения
     val_split = 0.2                 # Доля данных, выделяемая под валидацию
     gradient_clip = 1.0             # Максимальная норма градиента
-    batch_size = 256                # Размер батча (число примеров, обрабатываемых за один проход)
+    batch_size = 128                # Размер батча (число примеров, обрабатываемых за один проход)
     epochs = 100                    # Количество эпох обучения (полных проходов по всему датасету)
-    focal_gamma = 3                 # Параметр гамма для Focal Loss, регулирует степень фокусировки на сложных примерах
+    focal_gamma = 2                 # Параметр гамма для Focal Loss, регулирует степень фокусировки на сложных примерах
     smoothing = 0.1                 # Параметр label smoothing, задаёт уровень сглаживания меток для улучшения обобщения
     mixed_precision = True          # Использовать смешанную точность (fp16) для ускорения обучения
 
     # Параметры LR
     max_lr = 0.001                  # Максимальная скорость обучения (learning rate)
     ini_lr = 0.0001                 # Начальная скорость обучения
-    plateau_factor = 0.8            # Уменьшать lr
-    plateau_factor_threshold = 0.9  # Уменьшать threshold
-    plateau_threshold = 0.05        # Порог улучшения (относительный)
+    factor_lr = 0.8                 # Уменьшать lr
+    factor_threshold = 0.9          # Уменьшать threshold
+    threshold = 0.05        # Порог улучшения (относительный)
     early_stopping_patience = 10    # Количество эпох без улучшения для ранней остановки
 
 config = Config()
@@ -62,21 +63,12 @@ config = Config()
 class WarmupReduceLROnPlateau():
     """Warmup + ReduceLROnPlateau логика"""
 
-    def __init__(self, optimizer, ini_lr, max_lr, factor, factor_threshold, threshold):
+    def __init__(self, optimizer, threshold):
         self.optimizer = optimizer
-
-        self.max_lr = max_lr
-        self.ini_lr = ini_lr
         self.current_epoch = 0
-
-        # ReduceLROnPlateau параметры
-        self.factor = factor
         self.threshold = threshold
-        self.factor_threshold = factor_threshold
         self.num_bad = 0
         self.speed = 1
-
-        # Трекинг лучшего loss
         self.best_loss = float('inf')
 
     def step(self, epoch=None, validation_loss=None):
@@ -89,9 +81,9 @@ class WarmupReduceLROnPlateau():
         # Warmup фаза
         if self.current_epoch < 3:
             if self.current_epoch == 1:
-                lr = self.ini_lr
+                lr = config.ini_lr
             else:
-                lr = self.max_lr
+                lr = config.max_lr
 
             for param_group in self.optimizer.param_groups:
                 param_group['lr'] = lr
@@ -118,8 +110,8 @@ class WarmupReduceLROnPlateau():
 
     def _reduce_lr(self):
         """Уменьшение LR для всех групп параметров"""
-        self.threshold*=self.factor_threshold**self.speed
-        factor = self.factor**self.speed
+        self.threshold*=config.factor_threshold**self.speed
+        factor = config.factor_lr**self.speed
         for param_group in self.optimizer.param_groups:
             old_lr = param_group['lr']
             new_lr = old_lr * factor
@@ -132,16 +124,10 @@ class WarmupReduceLROnPlateau():
 
     def state_dict(self):
         return {
-            'max_lr': self.max_lr,
-            'ini_lr': self.ini_lr,
             'current_epoch': self.current_epoch,
-
-            'factor': self.factor,
             'threshold': self.threshold,
-            'factor_threshold' : self.factor_threshold,
             'num_bad' : self.num_bad,
             'speed' : self.speed,
-
             'best_loss': self.best_loss,
         }
 
@@ -151,17 +137,15 @@ class WarmupReduceLROnPlateau():
 
 # ====================== КОМПОНЕНТЫ МОДЕЛИ ======================
 class MoE(nn.Module):
-    def __init__(self, input_dim, num_experts, base_expert_units, k_top):
+    def __init__(self, input_dim):
         super().__init__()
-        self.num_experts = num_experts
-        self.k_top = k_top
         self.experts = nn.ModuleList()
 
         expert_sizes = []
-        for i in range(num_experts):
+        for i in range(config.num_experts):
             # От 0.25 до 1.75 с квадратичным распределением
-            scale = 0.25 + (i**2 / (num_experts-1)**2) * 1.5
-            size = int(base_expert_units * scale)
+            scale = 0.25 + (i**2 / (config.num_experts-1)**2) * 1.5
+            size = int(config.expert_units * scale)
             expert_sizes.append(size)
 
         print(f"MoE expert sizes: {expert_sizes}")
@@ -181,14 +165,14 @@ class MoE(nn.Module):
             nn.LayerNorm(input_dim * 2),
             nn.GELU(),
             nn.Dropout(config.dropout),
-            nn.Linear(input_dim * 2, num_experts * 2),  # Промежуточный слой
+            nn.Linear(input_dim * 2, config.num_experts * 2),  # Промежуточный слой
             nn.GELU(),
-            nn.Linear(num_experts * 2, num_experts)  # Финальная проекция
+            nn.Linear(config.num_experts * 2, config.num_experts)  # Финальная проекция
         )
 
     def forward(self, x):
         logits = self.router(x)
-        top_k_weights, top_k_indices = logits.topk(self.k_top, dim=1)
+        top_k_weights, top_k_indices = logits.topk(config.k_top_expert, dim=1)
         top_k_weights = torch.softmax(top_k_weights, dim=1)
 
         # Собираем выходы всех экспертов
@@ -264,30 +248,46 @@ class ResidualBlock(nn.Module):
 class AnimeClassifier(nn.Module):
     def __init__(self, num_classes):
         super().__init__()
-        # УСИЛЕННЫЙ БЭКБОН: каналы увеличены В 2 РАЗА для максимальной мощности
+        
+        def make_stage(in_channels, out_channels, num_blocks, first_stride=2):
+            """Создает стадию с несколькими ResidualBlock"""
+            blocks = []
+            for i in range(num_blocks):
+                stride = first_stride if i == 0 else 1
+                blocks.append(ResidualBlock(
+                    in_channels if i == 0 else out_channels,
+                    out_channels,
+                    stride=stride
+                ))
+            return nn.Sequential(*blocks)
+        
+        # Базовые каналы (фиксированные или можно масштабировать отдельно)
+        base_channels = [64, 128, 256, 512, 1024]
         self.backbone = nn.Sequential(
-            nn.Conv2d(3, 128, 7, stride=2, padding=3, bias=False),     # ↑ 64→128 (2×)
-            nn.BatchNorm2d(128),
+            # Stem
+            nn.Conv2d(3, base_channels[0], 7, stride=2, padding=3, bias=False),
+            nn.BatchNorm2d(base_channels[0]),
             nn.ReLU(inplace=True),
-            nn.MaxPool2d(3, stride=2, padding=1),
-            ResidualBlock(128, 128),       # ↑ 64→128 (2×)
-            ResidualBlock(128, 256, stride=2),  # ↑ 128→256 (2×)
-            ResidualBlock(256, 512, stride=2),  # ↑ 256→512 (2×)
-            ResidualBlock(512, 1024, stride=2), # ↑ 512→1024 (2×)
-            nn.AdaptiveAvgPool2d(1)       # Выход: [B, 1024, 1, 1]
+            
+            # Стадии
+            make_stage(base_channels[0], base_channels[1], config.depth, first_stride=2),
+            make_stage(base_channels[1], base_channels[2], config.depth, first_stride=2),
+            make_stage(base_channels[2], base_channels[3], config.depth, first_stride=2),
+            make_stage(base_channels[3], base_channels[4], config.depth, first_stride=2),
+            
+            nn.AdaptiveAvgPool2d(1)
         )
-        # MoE с 16 экспертами (вход 1024)
-        self.moe = MoE(1024, config.num_experts, config.expert_units, config.k_top_expert)
-        # Увеличенный классификатор
+        
+        self.moe = MoE(base_channels[4])
         self.classifier = nn.Sequential(
-            nn.Linear(1024, 1024),        # ↑ 512→1024 (2×)
+            nn.Linear(base_channels[4], base_channels[4]),
             nn.ReLU(inplace=True),
             nn.Dropout(config.dropout),
-            nn.Linear(1024, num_classes)  # ↑ 512→1024 (2×)
+            nn.Linear(base_channels[4], num_classes)
         )
 
     def forward(self, x):
-        x = self.backbone(x).flatten(1)   # [B, 1024]
+        x = self.backbone(x).flatten(1) 
         x = self.moe(x)
         return self.classifier(x)
 
@@ -448,18 +448,18 @@ def get_class_weights_from_dirs(root_dir, class_names):
     weights = weights / weights.max()  # нормализация
     return weights
 
-def focal_loss_with_smoothing(outputs, targets, gamma, smoothing, class_weights=None):
+def focal_loss_with_smoothing(outputs, targets, class_weights=None):
     num_classes = outputs.size(1)
-    confidence = 1.0 - smoothing
+    confidence = 1.0 - config.smoothing
 
     log_probs = torch.nn.functional.log_softmax(outputs, dim=-1)
     probs = torch.exp(log_probs)
 
-    true_dist = torch.full_like(log_probs, smoothing / (num_classes - 1))
+    true_dist = torch.full_like(log_probs, config.smoothing / (num_classes - 1))
     true_dist.scatter_(1, targets.unsqueeze(1), confidence)
 
     pt = torch.sum(true_dist * probs, dim=-1)
-    focal_factor = (1 - pt).pow(gamma)
+    focal_factor = (1 - pt).pow(config.focal_gamma)
     loss = -torch.sum(true_dist * log_probs, dim=-1)
 
     if class_weights is not None:
@@ -468,7 +468,7 @@ def focal_loss_with_smoothing(outputs, targets, gamma, smoothing, class_weights=
 
     return torch.mean(focal_factor * loss)
 
-def forward_with_mixup_cutmix(model, inputs, labels, config, class_weights, device):
+def forward_with_mixup_cutmix(model, inputs, labels, class_weights, device):
     inputs, labels = inputs.to(device), labels.to(device)
 
     use_mix = np.random.rand() < 0.50
@@ -482,12 +482,12 @@ def forward_with_mixup_cutmix(model, inputs, labels, config, class_weights, devi
 
         with torch.amp.autocast('cuda', enabled=config.mixed_precision):
             outputs = model(inputs)
-            loss = lam * focal_loss_with_smoothing(outputs, targets_a, config.focal_gamma, config.smoothing, class_weights)\
-                 + (1 - lam) * focal_loss_with_smoothing(outputs, targets_b, config.focal_gamma, config.smoothing, class_weights)
+            loss = lam * focal_loss_with_smoothing(outputs, targets_a, class_weights)\
+                 + (1 - lam) * focal_loss_with_smoothing(outputs, targets_b, class_weights)
     else:
         with torch.amp.autocast('cuda', enabled=config.mixed_precision):
             outputs = model(inputs)
-            loss = focal_loss_with_smoothing(outputs, labels, config.focal_gamma, config.smoothing, class_weights)
+            loss = focal_loss_with_smoothing(outputs, labels, class_weights)
 
     return outputs, loss
 
@@ -621,11 +621,7 @@ def run_training():
 
     scheduler = WarmupReduceLROnPlateau(
         optimizer=optimizer,
-        ini_lr=config.ini_lr,
-        max_lr=config.max_lr,
-        factor=config.plateau_factor,
-        factor_threshold=config.plateau_factor_threshold,
-        threshold=config.plateau_threshold,
+        threshold=config.threshold
     )
 
     scaler = torch.amp.GradScaler('cuda', enabled=config.mixed_precision and torch.cuda.is_available())
@@ -687,7 +683,7 @@ def run_training():
             inputs = inputs.to(device, non_blocking=True)  # Асинхронная передача
             labels = labels.to(device, non_blocking=True)
 
-            outputs, loss = forward_with_mixup_cutmix(model, inputs, labels, config, class_weights, device)
+            outputs, loss = forward_with_mixup_cutmix(model, inputs, labels, class_weights, device)
 
             scaler.scale(loss).backward()
             train_loss += loss.item()
@@ -731,7 +727,7 @@ def run_training():
 
                 outputs = model(inputs)
 
-                loss = focal_loss_with_smoothing(outputs, labels, config.focal_gamma, config.smoothing)
+                loss = focal_loss_with_smoothing(outputs, labels)
                 val_loss += loss.item()
 
                 _, predicted = torch.max(outputs, 1)
@@ -804,11 +800,7 @@ def convert_to_onnx():
     optimizer = optim.AdamW(model.parameters(), lr=config.ini_lr)
     scheduler = WarmupReduceLROnPlateau(
         optimizer=optimizer,
-        ini_lr=config.ini_lr,
-        max_lr=config.max_lr,
-        factor=config.plateau_factor,
-        factor_threshold=config.plateau_factor_threshold,
-        threshold=config.plateau_threshold,
+        threshold=config.threshold
     )
 
     loaded = load_checkpoint(model, optimizer, scheduler, config.checkpoint_path, device)
@@ -895,11 +887,7 @@ def test_onnx():
     optimizer = optim.AdamW(model.parameters(), lr=config.ini_lr)
     scheduler = WarmupReduceLROnPlateau(
         optimizer=optimizer,
-        ini_lr=config.ini_lr,
-        max_lr=config.max_lr,
-        factor=config.plateau_factor,
-        factor_threshold=config.plateau_factor_threshold,
-        threshold=config.plateau_threshold,
+        threshold=config.threshold
     )
 
     loaded = load_checkpoint(model, optimizer, scheduler, config.checkpoint_path, device)
@@ -952,6 +940,40 @@ def test_onnx():
     print(f"ONNX dtype: {onnx_probs.dtype}")
     print(f"Количество классов: {len(classes)}")
 
+def count_parameters_by_module():
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    with open(config.labels_path) as f:
+        classes = [line.strip() for line in f]
+
+    model = AnimeClassifier(len(classes)).to(device)
+
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"Всего параметров: {total_params:,}")
+
+    print("Параметры по группам:")
+    backbone_params = 0
+    moe_params = 0
+    classifier_params = 0
+    for name, param in model.named_parameters(): 
+        num = param.numel()
+        if name.startswith('backbone'):
+            backbone_params += num
+        elif name.startswith('moe'):
+            moe_params += num
+        elif name.startswith('classifier'):
+            classifier_params += num
+    print(f"Backbone: {backbone_params:,}")
+    print(f"MoE: {moe_params:,}")
+    print(f"Classifier: {classifier_params:,}")
+    print(f"Total: {(backbone_params + moe_params + classifier_params):,}")
+
+    # Процентное соотношение
+    print(f"\nПроцентное распределение:")
+    print(f"Backbone: {backbone_params/total_params*100:.2f}%")
+    print(f"MoE: {moe_params/total_params*100:.2f}%")
+    print(f"Classifier: {classifier_params/total_params*100:.2f}%\n")
+
 # ====================== ИНТЕРФЕЙС ======================
 def main_menu():
     while True:
@@ -962,10 +984,12 @@ def main_menu():
         print("2. Продолжить обучение")
         print("3. Конвертировать в ONNX")
         print("4. Протестировать ONNX")
+        print("5. Размер модели")
         choice = input("Выбор: ").strip()
 
         if choice == '1':
             config.resume_training = False
+            count_parameters_by_module()
             run_training()
         elif choice == '2':
             if not os.path.exists(config.checkpoint_path):
@@ -977,6 +1001,8 @@ def main_menu():
             convert_to_onnx()
         elif choice == '4':
             test_onnx()
+        elif choice == '5':
+            count_parameters_by_module()
         elif choice == '0':
             break
         else:
