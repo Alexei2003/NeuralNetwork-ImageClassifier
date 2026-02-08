@@ -33,17 +33,17 @@ class Config:
     input_size = (224, 224)         # Размер входного изображения (ширина, высота)
 
     # Архитектура модели и гиперпараметры
-    depth = 4                       # Количество ResidualBlock
+    depth = 8                       # Количество ResidualBlock
     expert_units = 1024             # Количество нейронов в каждом эксперте
     num_experts = 8                 # Количество экспертов в MoE (Mixture of Experts)
-    k_top_expert = 2                # Количество активных экспертов на один пример
+    k_top_expert = 4                # Количество активных экспертов на один пример
     se_reduction = 16               # Коэффициент редукции для SE (Squeeze-and-Excitation) блока
     dropout = 0.5                   # Вероятность отключения нейронов (dropout)
 
     # Параметры обучения
     val_split = 0.2                 # Доля данных, выделяемая под валидацию
     gradient_clip = 1.0             # Максимальная норма градиента
-    batch_size = 128                # Размер батча (число примеров, обрабатываемых за один проход)
+    batch_size = 320                # Размер батча (число примеров, обрабатываемых за один проход)
     epochs = 100                    # Количество эпох обучения (полных проходов по всему датасету)
     focal_gamma = 2                 # Параметр гамма для Focal Loss, регулирует степень фокусировки на сложных примерах
     smoothing = 0.1                 # Параметр label smoothing, задаёт уровень сглаживания меток для улучшения обобщения
@@ -54,7 +54,7 @@ class Config:
     ini_lr = 0.0001                 # Начальная скорость обучения
     factor_lr = 0.8                 # Уменьшать lr
     factor_threshold = 0.9          # Уменьшать threshold
-    threshold = 0.05        # Порог улучшения (относительный)
+    threshold = 0.05                # Порог улучшения (относительный)
     early_stopping_patience = 10    # Количество эпох без улучшения для ранней остановки
 
 config = Config()
@@ -248,7 +248,7 @@ class ResidualBlock(nn.Module):
 class AnimeClassifier(nn.Module):
     def __init__(self, num_classes):
         super().__init__()
-        
+
         def make_stage(in_channels, out_channels, num_blocks, first_stride=2):
             """Создает стадию с несколькими ResidualBlock"""
             blocks = []
@@ -260,24 +260,24 @@ class AnimeClassifier(nn.Module):
                     stride=stride
                 ))
             return nn.Sequential(*blocks)
-        
+
         # Базовые каналы (фиксированные или можно масштабировать отдельно)
-        base_channels = [64, 128, 256, 512, 1024]
+        base_channels = [64, 64, 128, 256, 512]
         self.backbone = nn.Sequential(
             # Stem
             nn.Conv2d(3, base_channels[0], 7, stride=2, padding=3, bias=False),
             nn.BatchNorm2d(base_channels[0]),
             nn.ReLU(inplace=True),
-            
+
             # Стадии
             make_stage(base_channels[0], base_channels[1], config.depth, first_stride=2),
             make_stage(base_channels[1], base_channels[2], config.depth, first_stride=2),
             make_stage(base_channels[2], base_channels[3], config.depth, first_stride=2),
             make_stage(base_channels[3], base_channels[4], config.depth, first_stride=2),
-            
+
             nn.AdaptiveAvgPool2d(1)
         )
-        
+
         self.moe = MoE(base_channels[4])
         self.classifier = nn.Sequential(
             nn.Linear(base_channels[4], base_channels[4]),
@@ -287,7 +287,7 @@ class AnimeClassifier(nn.Module):
         )
 
     def forward(self, x):
-        x = self.backbone(x).flatten(1) 
+        x = self.backbone(x).flatten(1)
         x = self.moe(x)
         return self.classifier(x)
 
@@ -780,12 +780,14 @@ def run_training():
         next_lr = scheduler.step(epoch+1, val_loss)
 
         # Логирование
-        print(f"[Summary] Train Loss: {train_loss/train_loader_len:.4f} | Acc: {train_accuracy:.2f}%")
-        print(f"[Summary] Val   Loss: {val_loss/val_loader_len:.4f} | Acc: {val_accuracy:.2f}%")
-        print(f"[Summary] Val Precision: {val_precision:.4f} | Recall: {val_recall:.4f} | F1: {val_f1:.4f}")
-        print(f"[Time]    Epoch: {epoch_duration_str} | Total: {total_elapsed_str}")
-        print(f"[LR]      Current: {current_lr:.8f}")
-        print(f"[LR]      Next:    {next_lr:.8f}")
+        print(f"[Summary]   Train Loss: {train_loss/train_loader_len:.4f} | Acc: {train_accuracy:.2f}%")
+        print(f"[Summary]   Val   Loss: {val_loss/val_loader_len:.4f} | Acc: {val_accuracy:.2f}%")
+        print(f"[Summary]   Val Precision: {val_precision:.4f} | Recall: {val_recall:.4f} | F1: {val_f1:.4f}")
+        print(f"[Time]      Epoch: {epoch_duration_str} | Total: {total_elapsed_str}")
+        print(f"[Speed]     Current: {scheduler.speed:.8f}")
+        print(f"[Threshold] Current: {scheduler.threshold:.8f}")
+        print(f"[LR]        Current: {current_lr:.8f}")
+        print(f"[LR]        Next:    {next_lr:.8f}")
 
         print()
 
@@ -955,7 +957,7 @@ def count_parameters_by_module():
     backbone_params = 0
     moe_params = 0
     classifier_params = 0
-    for name, param in model.named_parameters(): 
+    for name, param in model.named_parameters():
         num = param.numel()
         if name.startswith('backbone'):
             backbone_params += num
