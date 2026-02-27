@@ -13,6 +13,7 @@ import albumentations as A
 from albumentations.pytorch import ToTensorV2
 import torch.backends.cudnn
 from IPython.display import Audio, display
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 
 # ====================== КОНФИГУРАЦИЯ ======================
 class Config:
@@ -34,175 +35,26 @@ class Config:
 
     # Архитектура модели и гиперпараметры
     depth = 1                       # Количество ResidualBlock
-    expert_units = 1024             # Количество нейронов в каждом эксперте
-    num_experts = 8                 # Количество экспертов в MoE (Mixture of Experts)
-    k_top_expert = 4                # Количество активных экспертов на один пример
     se_reduction = 16               # Коэффициент редукции для SE (Squeeze-and-Excitation) блока
     dropout = 0.5                   # Вероятность отключения нейронов (dropout)
 
     # Параметры обучения
     val_split = 0.2                 # Доля данных, выделяемая под валидацию
     gradient_clip = 1.0             # Максимальная норма градиента
-    batch_size = 120                # Размер батча (число примеров, обрабатываемых за один проход)
+    batch_size =  512               # Размер батча (число примеров, обрабатываемых за один проход)
     epochs = 100                    # Количество эпох обучения (полных проходов по всему датасету)
     focal_gamma = 2                 # Параметр гамма для Focal Loss, регулирует степень фокусировки на сложных примерах
     smoothing = 0.1                 # Параметр label smoothing, задаёт уровень сглаживания меток для улучшения обобщения
     mixed_precision = True          # Использовать смешанную точность (fp16) для ускорения обучения
 
     # Параметры LR
-    max_lr = 0.001                  # Максимальная скорость обучения (learning rate)
-    ini_lr = 0.0001                 # Начальная скорость обучения
-    factor_lr = 0.8                 # Уменьшать lr
-    factor_threshold = 0.9          # Уменьшать threshold
-    threshold = 0.05                # Порог улучшения (относительный)
-    early_stopping_patience = 10    # Количество эпох без улучшения для ранней остановки
+    max_lr = 0.001                  # Максимальная скорость обучения
+    min_lr = 0.000001               # Минимальная скорость обучения
+    period_lr = 10                  # Период скорости обучения
 
 config = Config()
 
-# ====================== КОСИНУСНЫЙ ШЕДУЛЕР С WARMUP ======================
-class WarmupReduceLROnPlateau():
-    """Warmup + ReduceLROnPlateau логика"""
-
-    def __init__(self, optimizer, threshold):
-        self.optimizer = optimizer
-        self.current_epoch = 0
-        self.threshold = threshold
-        self.num_bad = 0
-        self.speed = 1
-        self.best_loss = float('inf')
-
-    def step(self, epoch=None, validation_loss=None):
-        """Вызывается в конце каждой эпохи с validation_loss"""
-        if epoch is not None:
-            self.current_epoch = epoch
-        else:
-            self.current_epoch += 1
-
-        # Warmup фаза
-        if self.current_epoch < 3:
-            if self.current_epoch == 1:
-                lr = config.ini_lr
-            else:
-                lr = config.max_lr
-
-            for param_group in self.optimizer.param_groups:
-                param_group['lr'] = lr
-
-            self.best_loss = validation_loss
-            return self.optimizer.param_groups[0]['lr']
-
-        if self._is_better(validation_loss, self.best_loss):
-            self.num_bad=0
-            self.best_loss=validation_loss
-            print(f"✓ Улучшение!")
-        else:
-            self.num_bad+=1
-            if self.num_bad > 1:
-                self.speed+=1
-                print(f"📉 Ускорение! Новый speed: {self.speed:.6f}")
-            self._reduce_lr()
-
-        return self.optimizer.param_groups[0]['lr']
-
-    def _is_better(self, current, best):
-        """Проверка, лучше ли текущий loss"""
-        return current < best - best * self.threshold
-
-    def _reduce_lr(self):
-        """Уменьшение LR для всех групп параметров"""
-        self.threshold*=config.factor_threshold**self.speed
-        factor = config.factor_lr**self.speed
-        for param_group in self.optimizer.param_groups:
-            old_lr = param_group['lr']
-            new_lr = old_lr * factor
-            param_group['lr'] = new_lr
-        print(f"📉 Уменьшение threshold! Новый threshold: {self.threshold:.6f}")
-        print(f"📉 Уменьшение LR! Новый LR: {self.optimizer.param_groups[0]['lr']:.6f}")
-
-    def get_last_lr(self):
-        return self.optimizer.param_groups[0]['lr']
-
-    def state_dict(self):
-        return {
-            'current_epoch': self.current_epoch,
-            'threshold': self.threshold,
-            'num_bad' : self.num_bad,
-            'speed' : self.speed,
-            'best_loss': self.best_loss,
-        }
-
-    def load_state_dict(self, state_dict):
-        for key, value in state_dict.items():
-            setattr(self, key, value)
-
 # ====================== КОМПОНЕНТЫ МОДЕЛИ ======================
-class MoE(nn.Module):
-    def __init__(self, input_dim):
-        super().__init__()
-        self.experts = nn.ModuleList()
-
-        expert_sizes = []
-        for i in range(config.num_experts):
-            # От 0.25 до 1.75 с квадратичным распределением
-            scale = 0.25 + (i**2 / (config.num_experts-1)**2) * 1.5
-            size = int(config.expert_units * scale)
-            expert_sizes.append(size)
-
-        print(f"MoE expert sizes: {expert_sizes}")
-
-        for size in expert_sizes:
-            self.experts.append(nn.Sequential(
-                nn.Linear(input_dim, size),
-                nn.BatchNorm1d(size),
-                nn.ReLU(inplace=True),
-                nn.Dropout(config.dropout),
-                nn.Linear(size, input_dim),
-                nn.BatchNorm1d(input_dim)
-            ))
-
-        self.router = nn.Sequential(
-            nn.Linear(input_dim, input_dim * 2),  # Увеличиваем мощность
-            nn.LayerNorm(input_dim * 2),
-            nn.GELU(),
-            nn.Dropout(config.dropout),
-            nn.Linear(input_dim * 2, config.num_experts * 2),  # Промежуточный слой
-            nn.GELU(),
-            nn.Linear(config.num_experts * 2, config.num_experts)  # Финальная проекция
-        )
-
-    def forward(self, x):
-        logits = self.router(x)
-        top_k_weights, top_k_indices = logits.topk(config.k_top_expert, dim=1)
-        top_k_weights = torch.softmax(top_k_weights, dim=1)
-
-        # Собираем выходы всех экспертов
-        expert_outputs = []
-        for expert in self.experts:
-            expert_outputs.append(expert(x))
-        expert_outputs = torch.stack(expert_outputs, dim=1)  # [B, num_experts, D]
-
-        # Создаем маску для выбранных экспертов
-        mask = torch.zeros_like(expert_outputs)
-        mask = torch.scatter(
-            mask,
-            1,
-            top_k_indices.unsqueeze(-1).expand(-1, -1, expert_outputs.size(-1)),
-            1.0
-        )
-
-        # Объединяем градиенты только для выбранных экспертов
-        expert_outputs = expert_outputs * mask + (expert_outputs * (1 - mask)).detach()
-
-        # Выбираем топ-k экспертов
-        selected_outputs = expert_outputs.gather(
-            1,
-            top_k_indices.unsqueeze(-1).expand(-1, -1, expert_outputs.size(-1))
-        )
-
-        # Взвешенное суммирование
-        output = (selected_outputs * top_k_weights.unsqueeze(-1)).sum(dim=1)
-        return output + x
-
 class ECABlock(nn.Module):
     def __init__(self, channels, k_size=3):
         super().__init__()
@@ -220,36 +72,39 @@ class ECABlock(nn.Module):
         return x * y.expand_as(x)
 
 class ResidualBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, stride=1):
+    def __init__(self, in_channels, out_channels, stride=1, dilation=1):
         super().__init__()
-        self.conv1 = nn.Conv2d(in_channels, out_channels, 3, stride, padding=1, bias=False)
+        # Первая свёртка теперь использует stride для downsampling
+        self.conv1 = nn.Conv2d(in_channels, out_channels, 3, stride=stride, padding=dilation, dilation=dilation, bias=False)
         self.bn1 = nn.BatchNorm2d(out_channels)
-        self.conv2 = nn.Conv2d(out_channels, out_channels, 3, padding=1, bias=False)
+        # Вторая свёртка всегда с stride=1
+        self.conv2 = nn.Conv2d(out_channels, out_channels, 3, stride=1, padding=dilation, dilation=dilation, bias=False)
         self.bn2 = nn.BatchNorm2d(out_channels)
-        self.eca = ECABlock(out_channels)  # 🔹 заменили SE на ECA
+        self.eca = ECABlock(out_channels)
         self.act = nn.ReLU(inplace=True)
         self.dropout = nn.Dropout2d(config.dropout)
 
+        # Shortcut должен приводить вход к размеру выхода
         self.shortcut = nn.Sequential()
         if stride != 1 or in_channels != out_channels:
             self.shortcut = nn.Sequential(
-                nn.Conv2d(in_channels, out_channels, 1, stride, bias=False),
+                nn.Conv2d(in_channels, out_channels, 1, stride=stride, bias=False),  # Свёртка 1x1 с нужным stride
                 nn.BatchNorm2d(out_channels)
             )
 
     def forward(self, x):
-        residual = self.shortcut(x)
+        residual = self.shortcut(x)          # Преобразованный вход для сложения
         x = self.act(self.bn1(self.conv1(x)))
         x = self.dropout(x)
         x = self.bn2(self.conv2(x))
-        x = self.eca(x)  # 🔹 используем ECA
+        x = self.eca(x)
         return self.act(x + residual)
 
 class AnimeClassifier(nn.Module):
     def __init__(self, num_classes):
         super().__init__()
 
-        def make_stage(in_channels, out_channels, num_blocks, first_stride=2):
+        def make_stage(in_channels, out_channels, num_blocks, first_stride=2, dilation=2):
             """Создает стадию с несколькими ResidualBlock"""
             blocks = []
             for i in range(num_blocks):
@@ -257,12 +112,13 @@ class AnimeClassifier(nn.Module):
                 blocks.append(ResidualBlock(
                     in_channels if i == 0 else out_channels,
                     out_channels,
-                    stride=stride
+                    stride=stride,
+                    dilation=dilation
                 ))
             return nn.Sequential(*blocks)
 
         # Базовые каналы (фиксированные или можно масштабировать отдельно)
-        base_channels = [64, 64, 128, 256, 512]
+        base_channels = [64, 128, 256, 512, 1024]
         self.backbone = nn.Sequential(
             # Stem
             nn.Conv2d(3, base_channels[0], 7, stride=2, padding=3, bias=False),
@@ -270,25 +126,22 @@ class AnimeClassifier(nn.Module):
             nn.ReLU(inplace=True),
 
             # Стадии
-            make_stage(base_channels[0], base_channels[1], config.depth, first_stride=2),
-            make_stage(base_channels[1], base_channels[2], config.depth, first_stride=2),
-            make_stage(base_channels[2], base_channels[3], config.depth, first_stride=2),
-            make_stage(base_channels[3], base_channels[4], config.depth, first_stride=2),
+            make_stage(base_channels[0], base_channels[1], config.depth, first_stride=2, dilation=2),
+            make_stage(base_channels[1], base_channels[2], config.depth, first_stride=2, dilation=2),
+            make_stage(base_channels[2], base_channels[3], config.depth, first_stride=2, dilation=2),
+            make_stage(base_channels[3], base_channels[4], config.depth, first_stride=2, dilation=2),
 
             nn.AdaptiveAvgPool2d(1)
         )
-
-        self.moe = MoE(base_channels[4])
         self.classifier = nn.Sequential(
-            nn.Linear(base_channels[4], base_channels[4]),
+            nn.Linear(base_channels[-1], base_channels[-1]),
             nn.ReLU(inplace=True),
             nn.Dropout(config.dropout),
-            nn.Linear(base_channels[4], num_classes)
+            nn.Linear(base_channels[-1], num_classes)
         )
 
     def forward(self, x):
         x = self.backbone(x).flatten(1)
-        x = self.moe(x)
         return self.classifier(x)
 
 # ====================== ОБРАБОТКА ДАННЫХ ======================
@@ -335,14 +188,14 @@ class ImageDataset(Dataset):
                 # ===================== ВСЕГДА ПРИМЕНЯЕТСЯ (p=1.0) =====================
                 A.RandomResizedCrop(             # 📏 СЛУЧАЙНОЕ КАДРИРОВАНИЕ С ИЗМЕНЕНИЕМ РАЗМЕРА
                     size=config.input_size,      # Фиксированный выходной размер (224x224)
-                    scale=(0.8, 1.0),            # Масштаб: 80-100% от исходного изображения
+                    scale=(0.5, 1.0),            # Масштаб: 80-100% от исходного изображения
                                                 # (меньше значение → больше обрезка)
                     interpolation=1,             # Метод интерполяции (1=билинейная)
                     p=1.0                        # ✅ ВСЕГДА применяется - основная аугментация
                 ),
 
                 # ===================== ЧАСТО ПРИМЕНЯЕТСЯ (p=0.5) =====================
-                A.Rotate(limit=30, p=0.5),       # 🔄 ПОВОРОТ
+                A.Rotate(limit=90, p=0.5),      # 🔄 ПОВОРОТ
                                                 # limit=30: случайный поворот ±30 градусов
                                                 # Учит модель распознавать объекты под разными углами
 
@@ -350,30 +203,30 @@ class ImageDataset(Dataset):
                                                 # Лево-правая симметрия, часто встречается в изображениях
 
                 A.ColorJitter(                   # 🎨 ЦВЕТОВЫЕ ИСКАЖЕНИЯ
-                    brightness=0.2,              # Яркость: ±20% (0.8-1.2 от исходной)
-                    contrast=0.2,                # Контраст: ±20%
-                    saturation=0.2,              # Насыщенность: ±20%
-                    hue=0.2,                     # Оттенок: ±0.2 (в нормированных единицах HSV)
+                    brightness=0.5,              # Яркость: ±20% (0.8-1.2 от исходной)
+                    contrast=0.5,                # Контраст: ±20%
+                    saturation=0.5,              # Насыщенность: ±20%
+                    hue=0.5,                     # Оттенок: ±0.2 (в нормированных единицах HSV)
                                                 # Меняет цвета, имитирует разные условия освещения
                     p=0.5                        # 50% вероятность применения
                 ),
 
                 A.Affine(                           # 📐 АФФИННЫЕ ПРЕОБРАЗОВАНИЯ
-                    translate_percent=(-0.1, 0.1),  # Сдвиг: ±10% от размеров изображения
+                    translate_percent=(-0.2, 0.2),  # Сдвиг: ±10% от размеров изображения
                     keep_ratio=True,                # Сохранять соотношение сторон при сдвиге
                     p=0.5                           # 50% вероятность
                 ),
 
                 # ===================== РЕДКО ПРИМЕНЯЕТСЯ (p=0.2) =====================
                 A.GaussianBlur(                  # 🌫 ГАУССОВО РАЗМЫТИЕ
-                    blur_limit=(3, 3),           # Размер ядра размытия: 3×3 пикселя
+                    blur_limit=(5, 5),           # Размер ядра размытия: 3×3 пикселя
                                                 # (нечетное число, больше → сильнее размытие)
                     p=0.2                        # 20% вероятность - имитирует расфокус
                 ),
 
                 # ===================== ОЧЕНЬ РЕДКО (p=0.1) =====================
                 A.RandomGridShuffle(             # 🧩 СЛУЧАЙНОЕ ПЕРЕМЕШИВАНИЕ СЕТКИ
-                    grid=(2, 2),                 # Разделить изображение на 2×2=4 части
+                    grid=(4, 4),                 # Разделить изображение на 2×2=4 части
                                                 # И перемешать их случайным образом
                     p=0.1                        # 10% вероятность - радикальная аугментация
                 ),
@@ -491,13 +344,6 @@ def forward_with_mixup_cutmix(model, inputs, labels, class_weights, device):
 
     return outputs, loss
 
-def compile_model(model):
-    torch.compile(model,
-        mode="max-autotune",
-        dynamic=False,
-        fullgraph=True)
-    torch.cuda.empty_cache()
-
 def save_checkpoint(model, epoch, optimizer, scheduler, path):
     """
     Сохранение чекпоинта без сжатия
@@ -567,6 +413,20 @@ def make_sound():
     # Воспроизводим автоматически
     display(Audio(audio_signal, rate=sample_rate, autoplay=True))
 
+def compile_model(model):
+    torch.compile(model,
+        mode="max-autotune",
+        dynamic=False,
+        fullgraph=True)
+    torch.cuda.empty_cache()
+
+def create_scheduler():
+    return  CosineAnnealingWarmRestarts(
+                eta_min = config.min_lr,
+                optimizer=optimizer,
+                T_0=config.period_lr,
+            )
+
 def run_training():
     # Оптимизация матричных операций
     torch.set_float32_matmul_precision('medium')
@@ -586,8 +446,9 @@ def run_training():
 
     print(f"📊 Количество классов: {len(full_classes)}")
     print(f"🚀 Конфигурация обучения:")
-    print(f"  • Ini LR: {config.ini_lr:.4f}")
-    print(f"  • Max LR: {config.max_lr:.4f}")
+    print(f"  • Max LR: {config.max_lr:.6f}")
+    print(f"  • Min LR: {config.min_lr:.6f}")
+    print(f"  • Период: {config.period_lr}")
     print(f"  • Всего эпох: {config.epochs}")
 
     # Создаем датасет с фиксированным порядком классов
@@ -617,16 +478,11 @@ def run_training():
 
     class_weights = get_class_weights_from_dirs(config.source_dir, full_classes).to(device)
 
-    optimizer = optim.AdamW(model.parameters(), lr=config.ini_lr)
+    optimizer = optim.AdamW(model.parameters(), lr=config.max_lr)
 
-    scheduler = WarmupReduceLROnPlateau(
-        optimizer=optimizer,
-        threshold=config.threshold
-    )
-
+    scheduler = create_scheduler()
     scaler = torch.amp.GradScaler('cuda', enabled=config.mixed_precision and torch.cuda.is_available())
     start_epoch = 1
-    early_stop_counter = 0
 
     if config.resume_training:
         loaded = load_checkpoint(model, optimizer, scheduler, config.checkpoint_path, device)
@@ -675,8 +531,8 @@ def run_training():
         optimizer.zero_grad(set_to_none=True)
         epoch_start_time = time.time()
 
-        current_lr = scheduler.get_last_lr()
-        print(f"[LR] Current: {current_lr:.8f}")
+        current_lr = scheduler.get_last_lr()[0]
+        print(f"[LR] Current: {current_lr:.6f}")
 
         batch_start_time = time.time()
         for batch_idx, (inputs, labels) in enumerate(train_loader):
@@ -761,33 +617,24 @@ def run_training():
         epoch_duration_str = time.strftime("%H:%M:%S", time.gmtime(epoch_duration))
         total_elapsed_str = time.strftime("%H:%M:%S", time.gmtime(total_elapsed_time))
 
-        # Ранняя остановка и сохранение чекпоинта
-        if val_loss < scheduler.best_loss:
-            early_stop_counter = 0
-            save_checkpoint(
-                model=model,
-                epoch=epoch,
-                optimizer=optimizer,
-                scheduler=scheduler,
-                path=config.checkpoint_path
-            )
-        else:
-            early_stop_counter += 1
-            if early_stop_counter >= config.early_stopping_patience:
-                print(f"[System]  Early Stop (no improvement for {early_stop_counter} epochs)")
-                break
+        scheduler.step()
+        next_lr = scheduler.get_last_lr()[0]
 
-        next_lr = scheduler.step(epoch+1, val_loss)
+        save_checkpoint(
+            model=model,
+            epoch=epoch,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            path=config.checkpoint_path
+        )
 
         # Логирование
         print(f"[Summary]   Train Loss: {train_loss/train_loader_len:.4f} | Acc: {train_accuracy:.2f}%")
         print(f"[Summary]   Val   Loss: {val_loss/val_loader_len:.4f} | Acc: {val_accuracy:.2f}%")
         print(f"[Summary]   Val Precision: {val_precision:.4f} | Recall: {val_recall:.4f} | F1: {val_f1:.4f}")
         print(f"[Time]      Epoch: {epoch_duration_str} | Total: {total_elapsed_str}")
-        print(f"[Speed]     Current: {scheduler.speed:.8f}")
-        print(f"[Threshold] Current: {scheduler.threshold:.8f}")
-        print(f"[LR]        Current: {current_lr:.8f}")
-        print(f"[LR]        Next:    {next_lr:.8f}")
+        print(f"[LR]        Current: {current_lr/config.max_lr:.6f} %")
+        print(f"[LR]        Next:    {next_lr/config.max_lr:.6f} %")
 
         print()
 
@@ -799,11 +646,8 @@ def convert_to_onnx():
         classes = [line.strip() for line in f]
 
     model = AnimeClassifier(len(classes)).to(device)
-    optimizer = optim.AdamW(model.parameters(), lr=config.ini_lr)
-    scheduler = WarmupReduceLROnPlateau(
-        optimizer=optimizer,
-        threshold=config.threshold
-    )
+    optimizer = optim.AdamW(model.parameters(), lr=config.max_lr)
+    scheduler = create_scheduler()
 
     loaded = load_checkpoint(model, optimizer, scheduler, config.checkpoint_path, device)
 
@@ -886,11 +730,8 @@ def test_onnx():
         classes = [line.strip() for line in f]
 
     model = AnimeClassifier(len(classes)).to(device)
-    optimizer = optim.AdamW(model.parameters(), lr=config.ini_lr)
-    scheduler = WarmupReduceLROnPlateau(
-        optimizer=optimizer,
-        threshold=config.threshold
-    )
+    optimizer = optim.AdamW(model.parameters(), lr=config.max_lr)
+    scheduler = create_scheduler()
 
     loaded = load_checkpoint(model, optimizer, scheduler, config.checkpoint_path, device)
 
@@ -978,6 +819,7 @@ def count_parameters_by_module():
 
 # ====================== ИНТЕРФЕЙС ======================
 def main_menu():
+    make_sound()
     while True:
         print("\n" + "="*50)
         print("🚀 Anime Classifier")
