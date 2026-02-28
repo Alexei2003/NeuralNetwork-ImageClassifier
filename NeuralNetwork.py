@@ -22,35 +22,36 @@ class Config:
     dir_save = "/content/drive/MyDrive/Colab Notebooks/NeuralNetwork-ImageClassifier/Model/"
 
     # Пути к данным и моделям
-    source_dir = dir_data + "Original"                     # Папка с исходными изображениями
+    source_dir = dir_data + "Original"                # Папка с исходными изображениями
     checkpoint_path = dir_save + "best_model.pth"     # Путь для сохранения/загрузки модели
     labels_path = dir_save + "labels.txt"             # Файл с метками классов
     onnx_path = dir_save + "model.onnx"               # Путь для экспортированной модели в ONNX формате
 
     # Флаги управления обучением
-    resume_training = False         # Продолжать обучение с сохраненного чекпоинта, если True
+    resume_training = False             # Продолжать обучение с сохраненного чекпоинта, если True
 
     # Параметры входных данных
-    input_size = (224, 224)         # Размер входного изображения (ширина, высота)
+    input_size = (224, 224)             # Размер входного изображения (ширина, высота)
 
     # Архитектура модели и гиперпараметры
-    depth = 1                       # Количество ResidualBlock
-    se_reduction = 16               # Коэффициент редукции для SE (Squeeze-and-Excitation) блока
-    dropout = 0.5                   # Вероятность отключения нейронов (dropout)
+    depth = 2                           # Количество ResidualBlock
+    dropout = 0.25                      # Вероятность отключения нейронов (dropout)
 
     # Параметры обучения
-    val_split = 0.2                 # Доля данных, выделяемая под валидацию
-    gradient_clip = 1.0             # Максимальная норма градиента
-    batch_size =  512               # Размер батча (число примеров, обрабатываемых за один проход)
-    epochs = 100                    # Количество эпох обучения (полных проходов по всему датасету)
-    focal_gamma = 2                 # Параметр гамма для Focal Loss, регулирует степень фокусировки на сложных примерах
-    smoothing = 0.1                 # Параметр label smoothing, задаёт уровень сглаживания меток для улучшения обобщения
-    mixed_precision = True          # Использовать смешанную точность (fp16) для ускорения обучения
+    val_split = 0.2                     # Доля данных, выделяемая под валидацию
+    gradient_clip = 1.0                 # Максимальная норма градиента
+    batch_size = 512                    # Размер батча (число примеров, обрабатываемых за один проход)
+    accumulation_steps = 10             # Количество батчей для накопления градиентов
+    epochs = 100                        # Количество эпох обучения (полных проходов по всему датасету)
+    focal_gamma = 1                     # Параметр гамма для Focal Loss, регулирует степень фокусировки на сложных примерах
+    smoothing = 0.1                     # Параметр label smoothing, задаёт уровень сглаживания меток для улучшения обобщения
+    mixed_precision = True              # Использовать смешанную точность (fp16) для ускорения обучения
 
     # Параметры LR
-    max_lr = 0.001                  # Максимальная скорость обучения
-    min_lr = 0.000001               # Минимальная скорость обучения
-    period_lr = 10                  # Период скорости обучения
+    max_lr = 0.0002                     # Максимальная скорость обучения
+    max_lr*=accumulation_steps
+    min_lr = 0.000001                   # Минимальная скорость обучения
+    period_lr = 10                      # Период скорости обучения
 
 config = Config()
 
@@ -71,40 +72,64 @@ class ECABlock(nn.Module):
         y = self.sigmoid(y).transpose(-1, -2).unsqueeze(-1)  # [B, C, 1, 1]
         return x * y.expand_as(x)
 
-class ResidualBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, stride=1, dilation=1):
+class DropPath(nn.Module):
+    def __init__(self, drop_prob=0.0):
         super().__init__()
-        # Первая свёртка теперь использует stride для downsampling
-        self.conv1 = nn.Conv2d(in_channels, out_channels, 3, stride=stride, padding=dilation, dilation=dilation, bias=False)
-        self.bn1 = nn.BatchNorm2d(out_channels)
-        # Вторая свёртка всегда с stride=1
-        self.conv2 = nn.Conv2d(out_channels, out_channels, 3, stride=1, padding=dilation, dilation=dilation, bias=False)
-        self.bn2 = nn.BatchNorm2d(out_channels)
-        self.eca = ECABlock(out_channels)
-        self.act = nn.ReLU(inplace=True)
-        self.dropout = nn.Dropout2d(config.dropout)
-
-        # Shortcut должен приводить вход к размеру выхода
-        self.shortcut = nn.Sequential()
-        if stride != 1 or in_channels != out_channels:
-            self.shortcut = nn.Sequential(
-                nn.Conv2d(in_channels, out_channels, 1, stride=stride, bias=False),  # Свёртка 1x1 с нужным stride
-                nn.BatchNorm2d(out_channels)
-            )
+        self.drop_prob = drop_prob
 
     def forward(self, x):
-        residual = self.shortcut(x)          # Преобразованный вход для сложения
-        x = self.act(self.bn1(self.conv1(x)))
-        x = self.dropout(x)
-        x = self.bn2(self.conv2(x))
+        if self.drop_prob == 0.0 or not self.training:
+            return x
+        keep_prob = 1 - self.drop_prob
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        random_tensor = keep_prob + torch.rand(shape, device=x.device)
+        random_tensor.floor_()
+        return x.div(keep_prob) * random_tensor
+
+
+class ResidualBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, stride=1):
+        super().__init__()
+
+        self.norm1 = nn.GroupNorm(32, in_channels)
+        self.act1 = nn.GELU()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, 3, stride=stride, padding=1, bias=False)
+
+        self.norm2 = nn.GroupNorm(32, out_channels)
+        self.act2 = nn.GELU()
+        self.conv2 = nn.Conv2d(out_channels, out_channels, 3, padding=1, bias=False)
+
+        self.eca = ECABlock(out_channels)
+
+        self.drop_path = DropPath(config.dropout)
+        self.gamma = nn.Parameter(torch.ones(out_channels) * 1e-6)
+
+        if stride != 1 or in_channels != out_channels:
+            self.shortcut = nn.Conv2d(in_channels, out_channels, 1, stride=stride, bias=False)
+        else:
+            self.shortcut = nn.Identity()
+
+    def forward(self, x):
+        residual = self.shortcut(x)
+
+        x = self.norm1(x)
+        x = self.act1(x)
+        x = self.conv1(x)
+
+        x = self.norm2(x)
+        x = self.act2(x)
+        x = self.conv2(x)
+
         x = self.eca(x)
-        return self.act(x + residual)
+        x = self.gamma.view(1, -1, 1, 1) * x
+
+        return residual + self.drop_path(x)
 
 class AnimeClassifier(nn.Module):
     def __init__(self, num_classes):
         super().__init__()
 
-        def make_stage(in_channels, out_channels, num_blocks, first_stride=2, dilation=2):
+        def make_stage(in_channels, out_channels, num_blocks, first_stride=2):
             """Создает стадию с несколькими ResidualBlock"""
             blocks = []
             for i in range(num_blocks):
@@ -112,8 +137,7 @@ class AnimeClassifier(nn.Module):
                 blocks.append(ResidualBlock(
                     in_channels if i == 0 else out_channels,
                     out_channels,
-                    stride=stride,
-                    dilation=dilation
+                    stride=stride
                 ))
             return nn.Sequential(*blocks)
 
@@ -122,26 +146,28 @@ class AnimeClassifier(nn.Module):
         self.backbone = nn.Sequential(
             # Stem
             nn.Conv2d(3, base_channels[0], 7, stride=2, padding=3, bias=False),
-            nn.BatchNorm2d(base_channels[0]),
-            nn.ReLU(inplace=True),
+            nn.GroupNorm(32, base_channels[0]),
+            nn.GELU(),
 
             # Стадии
-            make_stage(base_channels[0], base_channels[1], config.depth, first_stride=2, dilation=2),
-            make_stage(base_channels[1], base_channels[2], config.depth, first_stride=2, dilation=2),
-            make_stage(base_channels[2], base_channels[3], config.depth, first_stride=2, dilation=2),
-            make_stage(base_channels[3], base_channels[4], config.depth, first_stride=2, dilation=2),
+            make_stage(base_channels[0], base_channels[1], config.depth, first_stride=2),
+            make_stage(base_channels[1], base_channels[2], config.depth, first_stride=2),
+            make_stage(base_channels[2], base_channels[3], config.depth, first_stride=2),
+            make_stage(base_channels[3], base_channels[4], config.depth, first_stride=2),
 
             nn.AdaptiveAvgPool2d(1)
         )
+        self.embedding = nn.Sequential(
+            nn.Linear(base_channels[-1], base_channels[-1]//2),
+            nn.LayerNorm(base_channels[-1]//2),
+        )
         self.classifier = nn.Sequential(
-            nn.Linear(base_channels[-1], base_channels[-1]),
-            nn.ReLU(inplace=True),
-            nn.Dropout(config.dropout),
-            nn.Linear(base_channels[-1], num_classes)
+            nn.Linear(base_channels[-1]//2, num_classes)
         )
 
     def forward(self, x):
         x = self.backbone(x).flatten(1)
+        x = self.embedding(x)
         return self.classifier(x)
 
 # ====================== ОБРАБОТКА ДАННЫХ ======================
@@ -225,12 +251,6 @@ class ImageDataset(Dataset):
                 ),
 
                 # ===================== ОЧЕНЬ РЕДКО (p=0.1) =====================
-                A.RandomGridShuffle(             # 🧩 СЛУЧАЙНОЕ ПЕРЕМЕШИВАНИЕ СЕТКИ
-                    grid=(4, 4),                 # Разделить изображение на 2×2=4 части
-                                                # И перемешать их случайным образом
-                    p=0.1                        # 10% вероятность - радикальная аугментация
-                ),
-
                 A.Sharpen(                       # 🔪 ПОВЫШЕНИЕ РЕЗКОСТИ
                     alpha=(0.2, 0.5),            # Сила эффекта: 20-50%
                                                 # (0=нет эффекта, 1=максимальная резкость)
@@ -420,12 +440,14 @@ def compile_model(model):
         fullgraph=True)
     torch.cuda.empty_cache()
 
-def create_scheduler():
-    return  CosineAnnealingWarmRestarts(
-                eta_min = config.min_lr,
-                optimizer=optimizer,
-                T_0=config.period_lr,
-            )
+def create_learning(model):
+    optimizer = optim.AdamW(model.parameters(), lr=config.max_lr)
+    scheduler = CosineAnnealingWarmRestarts(
+                    eta_min = config.min_lr,
+                    optimizer=optimizer,
+                    T_0=config.period_lr,
+                )
+    return  optimizer, scheduler
 
 def run_training():
     # Оптимизация матричных операций
@@ -478,9 +500,8 @@ def run_training():
 
     class_weights = get_class_weights_from_dirs(config.source_dir, full_classes).to(device)
 
-    optimizer = optim.AdamW(model.parameters(), lr=config.max_lr)
+    optimizer, scheduler = create_learning(model)
 
-    scheduler = create_scheduler()
     scaler = torch.amp.GradScaler('cuda', enabled=config.mixed_precision and torch.cuda.is_available())
     start_epoch = 1
 
@@ -535,28 +556,36 @@ def run_training():
         print(f"[LR] Current: {current_lr:.6f}")
 
         batch_start_time = time.time()
+        optimizer.zero_grad()
+
         for batch_idx, (inputs, labels) in enumerate(train_loader):
-            inputs = inputs.to(device, non_blocking=True)  # Асинхронная передача
+            inputs = inputs.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
 
             outputs, loss = forward_with_mixup_cutmix(model, inputs, labels, class_weights, device)
 
+            # Сохраняем значение loss для логирования
+            raw_loss = loss.item()
+            # Делим loss на число накоплений, чтобы средний градиент соответствовал суммарному батчу
+            loss = loss / config.accumulation_steps
+
             scaler.scale(loss).backward()
-            train_loss += loss.item()
-
-            # Градиентный клиппинг
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.gradient_clip)
-
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad(set_to_none=True)
+            train_loss += raw_loss   # добавляем исходный loss (до деления)
 
             _, predicted = torch.max(outputs, 1)
             current_batch_size = labels.size(0)
             train_total += current_batch_size
             train_correct += (predicted == labels).sum().item()
 
+            # Обновление весов после накопления достаточного числа батчей
+            if (batch_idx + 1) % config.accumulation_steps == 0 or (batch_idx + 1) == len(train_loader):
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.gradient_clip)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+
+            # Расчёт времени и вывод (без изменений)
             batch_duration = (time.time() - batch_start_time) / (batch_idx + 1)
             remaining_batches = train_loader_len - (batch_idx + 1)
             estimated_remaining_time = remaining_batches * batch_duration
@@ -564,7 +593,7 @@ def run_training():
 
             print(
                 f"\r[Train] Epoch {epoch}/{config.epochs} | Batch {batch_idx+1}/{train_loader_len} | "
-                f"Loss: {(loss.item()):.4f} | Remaining time: {remaining_time_str}",
+                f"Loss: {(raw_loss):.4f} | Remaining time: {remaining_time_str}",
                 end='', flush=True)
 
         train_accuracy = 100 * train_correct / train_total
@@ -646,8 +675,7 @@ def convert_to_onnx():
         classes = [line.strip() for line in f]
 
     model = AnimeClassifier(len(classes)).to(device)
-    optimizer = optim.AdamW(model.parameters(), lr=config.max_lr)
-    scheduler = create_scheduler()
+    optimizer, scheduler = create_learning(model)
 
     loaded = load_checkpoint(model, optimizer, scheduler, config.checkpoint_path, device)
 
@@ -730,8 +758,8 @@ def test_onnx():
         classes = [line.strip() for line in f]
 
     model = AnimeClassifier(len(classes)).to(device)
-    optimizer = optim.AdamW(model.parameters(), lr=config.max_lr)
-    scheduler = create_scheduler()
+
+    optimizer, scheduler = create_learning(model)
 
     loaded = load_checkpoint(model, optimizer, scheduler, config.checkpoint_path, device)
 
@@ -796,25 +824,20 @@ def count_parameters_by_module():
 
     print("Параметры по группам:")
     backbone_params = 0
-    moe_params = 0
     classifier_params = 0
     for name, param in model.named_parameters():
         num = param.numel()
         if name.startswith('backbone'):
             backbone_params += num
-        elif name.startswith('moe'):
-            moe_params += num
         elif name.startswith('classifier'):
             classifier_params += num
     print(f"Backbone: {backbone_params:,}")
-    print(f"MoE: {moe_params:,}")
     print(f"Classifier: {classifier_params:,}")
-    print(f"Total: {(backbone_params + moe_params + classifier_params):,}")
+    print(f"Total: {(backbone_params + classifier_params):,}")
 
     # Процентное соотношение
     print(f"\nПроцентное распределение:")
     print(f"Backbone: {backbone_params/total_params*100:.2f}%")
-    print(f"MoE: {moe_params/total_params*100:.2f}%")
     print(f"Classifier: {classifier_params/total_params*100:.2f}%\n")
 
 # ====================== ИНТЕРФЕЙС ======================
