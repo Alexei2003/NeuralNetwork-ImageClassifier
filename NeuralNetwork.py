@@ -1,4 +1,4 @@
-import torch
+# import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
@@ -14,12 +14,18 @@ from albumentations.pytorch import ToTensorV2
 import torch.backends.cudnn
 from IPython.display import Audio, display
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+import torch.nn.functional as F
 
 # ====================== КОНФИГУРАЦИЯ ======================
 class Config:
     # выбор системы
-    dir_data = "/content/NeuralNetwork-ImageClassifier/DataSet/ARTS/"
-    dir_save = "/content/drive/MyDrive/Colab Notebooks/NeuralNetwork-ImageClassifier/Model/"
+    system = "google"
+    if (system == "google"):
+        dir_data = "/content/NeuralNetwork-ImageClassifier/DataSet/ARTS/"
+        dir_save = "/content/drive/MyDrive/Colab Notebooks/NeuralNetwork-ImageClassifier/Model/"
+    else:
+        dir_data = "/kaggle/working/NeuralNetwork-ImageClassifier/DataSet/ARTS/"
+        dir_save = "/kaggle/working/"
 
     # Пути к данным и моделям
     source_dir = dir_data + "Original"                # Папка с исходными изображениями
@@ -35,22 +41,20 @@ class Config:
 
     # Архитектура модели и гиперпараметры
     depth = 2                           # Количество ResidualBlock
-    dropout = 0.25                      # Вероятность отключения нейронов (dropout)
+    dropout = 0.1                       # Вероятность отключения нейронов (dropout)
 
     # Параметры обучения
     val_split = 0.2                     # Доля данных, выделяемая под валидацию
     gradient_clip = 1.0                 # Максимальная норма градиента
-    batch_size = 512                    # Размер батча (число примеров, обрабатываемых за один проход)
-    accumulation_steps = 10             # Количество батчей для накопления градиентов
+    batch_size = 256                    # Размер батча (число примеров, обрабатываемых за один проход)
     epochs = 100                        # Количество эпох обучения (полных проходов по всему датасету)
     focal_gamma = 1                     # Параметр гамма для Focal Loss, регулирует степень фокусировки на сложных примерах
     smoothing = 0.1                     # Параметр label smoothing, задаёт уровень сглаживания меток для улучшения обобщения
     mixed_precision = True              # Использовать смешанную точность (fp16) для ускорения обучения
 
     # Параметры LR
-    max_lr = 0.0002                     # Максимальная скорость обучения
-    max_lr*=accumulation_steps
-    min_lr = 0.000001                   # Минимальная скорость обучения
+    max_lr = 0.0001                     # Максимальная скорость обучения
+    min_lr = 0.0000000001               # Минимальная скорость обучения
     period_lr = 10                      # Период скорости обучения
 
 config = Config()
@@ -86,7 +90,6 @@ class DropPath(nn.Module):
         random_tensor.floor_()
         return x.div(keep_prob) * random_tensor
 
-
 class ResidualBlock(nn.Module):
     def __init__(self, in_channels, out_channels, stride=1):
         super().__init__()
@@ -102,7 +105,6 @@ class ResidualBlock(nn.Module):
         self.eca = ECABlock(out_channels)
 
         self.drop_path = DropPath(config.dropout)
-        self.gamma = nn.Parameter(torch.ones(out_channels) * 1e-6)
 
         if stride != 1 or in_channels != out_channels:
             self.shortcut = nn.Conv2d(in_channels, out_channels, 1, stride=stride, bias=False)
@@ -121,7 +123,6 @@ class ResidualBlock(nn.Module):
         x = self.conv2(x)
 
         x = self.eca(x)
-        x = self.gamma.view(1, -1, 1, 1) * x
 
         return residual + self.drop_path(x)
 
@@ -157,17 +158,50 @@ class AnimeClassifier(nn.Module):
 
             nn.AdaptiveAvgPool2d(1)
         )
-        self.embedding = nn.Sequential(
-            nn.Linear(base_channels[-1], base_channels[-1]//2),
-            nn.LayerNorm(base_channels[-1]//2),
-        )
-        self.classifier = nn.Sequential(
-            nn.Linear(base_channels[-1]//2, num_classes)
+        # Embedding с residual блоками
+        hidden = base_channels[-1]
+        self.embedding_block = nn.Sequential(
+            # 1
+            nn.Linear(hidden, hidden * 2),
+            nn.GELU(),
+            nn.LayerNorm(hidden * 2),
+            nn.Dropout(p=config.dropout),
+
+            # 2
+            nn.Linear(hidden * 2, hidden),
+            nn.GELU(),
+            nn.LayerNorm(hidden),
+            nn.Dropout(p=config.dropout),
+
+            # 3
+            nn.Linear(hidden, hidden // 2),
+            nn.GELU(),
+            nn.LayerNorm(hidden // 2),
+            nn.Dropout(p=config.dropout),
+
+            # 4
+            nn.Linear(hidden // 2, hidden),
+            nn.GELU(),
+            nn.LayerNorm(hidden),
+            nn.Dropout(p=config.dropout),
+
+            # 5
+            nn.Linear(hidden, hidden // 2),
+            nn.GELU(),
+            nn.LayerNorm(hidden // 2),
+            nn.Dropout(p=config.dropout),
         )
 
+        # Классификатор теперь принимает backbone + embedding
+        self.classifier = nn.Linear(hidden + hidden // 2, num_classes)
+
     def forward(self, x):
-        x = self.backbone(x).flatten(1)
-        x = self.embedding(x)
+        x_backbone = self.backbone(x).flatten(1)  # [B, hidden]
+        x_embed = self.embedding_block(x_backbone)  # [B, hidden//2]
+
+        # соединяем backbone + embedding
+        x = torch.cat([x_backbone, x_embed], dim=1)  # [B, hidden + hidden//2]
+
         return self.classifier(x)
 
 # ====================== ОБРАБОТКА ДАННЫХ ======================
@@ -433,13 +467,6 @@ def make_sound():
     # Воспроизводим автоматически
     display(Audio(audio_signal, rate=sample_rate, autoplay=True))
 
-def compile_model(model):
-    torch.compile(model,
-        mode="max-autotune",
-        dynamic=False,
-        fullgraph=True)
-    torch.cuda.empty_cache()
-
 def create_learning(model):
     optimizer = optim.AdamW(model.parameters(), lr=config.max_lr)
     scheduler = CosineAnnealingWarmRestarts(
@@ -468,8 +495,8 @@ def run_training():
 
     print(f"📊 Количество классов: {len(full_classes)}")
     print(f"🚀 Конфигурация обучения:")
-    print(f"  • Max LR: {config.max_lr:.6f}")
-    print(f"  • Min LR: {config.min_lr:.6f}")
+    print(f"  • Max LR: {config.max_lr:.10f}")
+    print(f"  • Min LR: {config.min_lr:.10f}")
     print(f"  • Период: {config.period_lr}")
     print(f"  • Всего эпох: {config.epochs}")
 
@@ -513,15 +540,10 @@ def run_training():
             optimizer = loaded['optimizer']
             scheduler = loaded['scheduler']
             start_epoch = loaded['epoch'] + 1
-
-            # Компиляция модели
-            compile_model(model)
-
             print(f"🔄 Продолжение обучения с эпохи {start_epoch}")
             print(f"  Текущий LR: {optimizer.param_groups[0]['lr']:.6f}")
         else:
             print("❌ Не удалось загрузить чекпоинт, начинаем обучение с нуля")
-            compile_model(model)
             save_checkpoint(
                 model=model,
                 epoch=-1,
@@ -530,7 +552,6 @@ def run_training():
                 path=config.checkpoint_path
             )
     else:
-        compile_model(model)
         save_checkpoint(
             model=model,
             epoch=-1,
@@ -553,7 +574,7 @@ def run_training():
         epoch_start_time = time.time()
 
         current_lr = scheduler.get_last_lr()[0]
-        print(f"[LR] Current: {current_lr:.6f}")
+        print(f"[LR] Current: {current_lr:.10f}")
 
         batch_start_time = time.time()
         optimizer.zero_grad()
@@ -566,8 +587,6 @@ def run_training():
 
             # Сохраняем значение loss для логирования
             raw_loss = loss.item()
-            # Делим loss на число накоплений, чтобы средний градиент соответствовал суммарному батчу
-            loss = loss / config.accumulation_steps
 
             scaler.scale(loss).backward()
             train_loss += raw_loss   # добавляем исходный loss (до деления)
@@ -577,13 +596,11 @@ def run_training():
             train_total += current_batch_size
             train_correct += (predicted == labels).sum().item()
 
-            # Обновление весов после накопления достаточного числа батчей
-            if (batch_idx + 1) % config.accumulation_steps == 0 or (batch_idx + 1) == len(train_loader):
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.gradient_clip)
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad(set_to_none=True)
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.gradient_clip)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
 
             # Расчёт времени и вывод (без изменений)
             batch_duration = (time.time() - batch_start_time) / (batch_idx + 1)
@@ -814,8 +831,11 @@ def test_onnx():
 def count_parameters_by_module():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    with open(config.labels_path) as f:
-        classes = [line.strip() for line in f]
+    if os.path.exists(config.labels_path):
+        with open(config.labels_path, 'r') as f:
+            classes = [line.strip() for line in f if line.strip()]
+    else:
+        classes = [f"class_{i}" for i in range(1000)]
 
     model = AnimeClassifier(len(classes)).to(device)
 
@@ -824,20 +844,25 @@ def count_parameters_by_module():
 
     print("Параметры по группам:")
     backbone_params = 0
+    embedding_params = 0
     classifier_params = 0
     for name, param in model.named_parameters():
         num = param.numel()
         if name.startswith('backbone'):
             backbone_params += num
+        if name.startswith('embedding'):
+            embedding_params += num
         elif name.startswith('classifier'):
             classifier_params += num
     print(f"Backbone: {backbone_params:,}")
+    print(f"Embedding: {embedding_params:,}")
     print(f"Classifier: {classifier_params:,}")
-    print(f"Total: {(backbone_params + classifier_params):,}")
+    print(f"Total: {(backbone_params + embedding_params + classifier_params):,}")
 
     # Процентное соотношение
     print(f"\nПроцентное распределение:")
     print(f"Backbone: {backbone_params/total_params*100:.2f}%")
+    print(f"Embedding: {embedding_params/total_params*100:.2f}%")
     print(f"Classifier: {classifier_params/total_params*100:.2f}%\n")
 
 # ====================== ИНТЕРФЕЙС ======================
