@@ -328,14 +328,7 @@ class CosineDecayRestarts():
         self.gamma = gamma
 
     def step(self):
-        cos = (1 + math.cos(math.pi * self.step_in_cycle / self.cycle_steps)) / 2
-        lr = self.min_lr + (self.max_lr - self.min_lr) * cos
-
-        for param_group in self.optimizer.param_groups:
-            param_group['lr'] = lr
-
         self.step_in_cycle += 1
-
         if self.step_in_cycle >= self.cycle_steps:
 
             self.cycle += 1
@@ -343,6 +336,12 @@ class CosineDecayRestarts():
 
             # уменьшаем max_lr
             self.max_lr = self.base_max_lr * (self.gamma ** self.cycle)
+
+        cos = (1 + math.cos(math.pi * self.step_in_cycle / self.cycle_steps)) / 2
+        lr = self.min_lr + (self.max_lr - self.min_lr) * cos
+
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = lr
 
     def get_last_lr(self):
         return [self.optimizer.param_groups[0]['lr']]
