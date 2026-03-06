@@ -319,7 +319,7 @@ class CosineDecayRestarts():
 
         self.first_cycle_steps = first_cycle_steps
         self.cycle_steps = first_cycle_steps
-        self.step_in_cycle = 1
+        self.step_in_cycle = 0
         self.cycle = 0
 
         self.base_max_lr = max_lr
@@ -336,7 +336,7 @@ class CosineDecayRestarts():
 
         self.step_in_cycle += 1
 
-        if self.step_in_cycle > self.cycle_steps:
+        if self.step_in_cycle >= self.cycle_steps:
 
             self.cycle += 1
             self.step_in_cycle = 0
