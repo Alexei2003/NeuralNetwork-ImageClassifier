@@ -1,4 +1,3 @@
-# import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
@@ -14,7 +13,7 @@ from albumentations.pytorch import ToTensorV2
 import torch.backends.cudnn
 from IPython.display import Audio, display
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
-import torch.nn.functional as F
+import math
 
 # ====================== КОНФИГУРАЦИЯ ======================
 class Config:
@@ -56,6 +55,7 @@ class Config:
     max_lr = 0.0001                     # Максимальная скорость обучения
     min_lr = 0.0000000001               # Минимальная скорость обучения
     period_lr = 10                      # Период скорости обучения
+    gamma_lr = 0.9                      # Скорость уменьшения max_lr
 
 config = Config()
 
@@ -306,6 +306,56 @@ class ImageDataset(Dataset):
         ])
 
 # ====================== ОБУЧЕНИЕ ======================
+class CosineDecayRestarts():
+    def __init__(
+        self,
+        optimizer,
+        first_cycle_steps,
+        max_lr,
+        min_lr,
+        gamma
+    ):
+        self.optimizer = optimizer
+
+        self.first_cycle_steps = first_cycle_steps
+        self.cycle_steps = first_cycle_steps
+        self.step_in_cycle = 1
+        self.cycle = 0
+
+        self.base_max_lr = max_lr
+        self.max_lr = max_lr
+        self.min_lr = min_lr
+        self.gamma = gamma
+
+    def step(self):
+        cos = (1 + math.cos(math.pi * self.step_in_cycle / self.cycle_steps)) / 2
+        lr = self.min_lr + (self.max_lr - self.min_lr) * cos
+
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = lr
+
+        self.step_in_cycle += 1
+
+        if self.step_in_cycle > self.cycle_steps:
+
+            self.cycle += 1
+            self.step_in_cycle = 0
+
+            # уменьшаем max_lr
+            self.max_lr = self.base_max_lr * (self.gamma ** self.cycle)
+
+    def get_last_lr(self):
+        return [self.optimizer.param_groups[0]['lr']]
+
+    def state_dict(self):
+        return {
+            k: v for k, v in self.__dict__.items()
+            if k != "optimizer"
+        }
+
+    def load_state_dict(self, state_dict):
+        self.__dict__.update(state_dict)
+
 def mixup_data(x, y, alpha=1.0):
     if alpha > 0:
         lam = np.random.beta(alpha, alpha)
@@ -438,6 +488,7 @@ def load_checkpoint(model, optimizer, scheduler, path, device):
         if scheduler and 'scheduler_state_dict' in checkpoint and checkpoint['scheduler_state_dict']:
             if hasattr(scheduler, 'load_state_dict'):
                 scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                scheduler.optimizer = optimizer
             else:
                 print("⚠️  Scheduler не поддерживает load_state_dict")
 
@@ -469,12 +520,16 @@ def make_sound():
 
 def create_learning(model):
     optimizer = optim.AdamW(model.parameters(), lr=config.max_lr)
-    scheduler = CosineAnnealingWarmRestarts(
-                    eta_min = config.min_lr,
-                    optimizer=optimizer,
-                    T_0=config.period_lr,
-                )
-    return  optimizer, scheduler
+
+    scheduler = CosineDecayRestarts(
+        optimizer=optimizer,
+        first_cycle_steps=config.period_lr,
+        max_lr=config.max_lr,
+        min_lr=config.min_lr,
+        gamma=config.gamma_lr
+    )
+
+    return optimizer, scheduler
 
 def run_training():
     # Оптимизация матричных операций
@@ -541,7 +596,7 @@ def run_training():
             scheduler = loaded['scheduler']
             start_epoch = loaded['epoch'] + 1
             print(f"🔄 Продолжение обучения с эпохи {start_epoch}")
-            print(f"  Текущий LR: {optimizer.param_groups[0]['lr']:.6f}")
+            print(f"  Текущий LR: {optimizer.param_groups[0]['lr']:.10f}")
         else:
             print("❌ Не удалось загрузить чекпоинт, начинаем обучение с нуля")
             save_checkpoint(
@@ -679,8 +734,8 @@ def run_training():
         print(f"[Summary]   Val   Loss: {val_loss/val_loader_len:.4f} | Acc: {val_accuracy:.2f}%")
         print(f"[Summary]   Val Precision: {val_precision:.4f} | Recall: {val_recall:.4f} | F1: {val_f1:.4f}")
         print(f"[Time]      Epoch: {epoch_duration_str} | Total: {total_elapsed_str}")
-        print(f"[LR]        Current: {current_lr/config.max_lr:.6f} %")
-        print(f"[LR]        Next:    {next_lr/config.max_lr:.6f} %")
+        print(f"[LR]        Current: {current_lr/config.max_lr:.2f} %")
+        print(f"[LR]        Next:    {next_lr/config.max_lr:.2f} %")
 
         print()
 
