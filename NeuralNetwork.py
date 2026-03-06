@@ -319,7 +319,7 @@ class CosineDecayRestarts():
 
         self.first_cycle_steps = first_cycle_steps
         self.cycle_steps = first_cycle_steps
-        self.step_in_cycle = 0
+        self.step_in_cycle = 1
         self.cycle = 0
 
         self.base_max_lr = max_lr
@@ -328,20 +328,19 @@ class CosineDecayRestarts():
         self.gamma = gamma
 
     def step(self):
-        self.step_in_cycle += 1
-        if self.step_in_cycle >= self.cycle_steps:
-
-            self.cycle += 1
-            self.step_in_cycle = 0
-
-            # уменьшаем max_lr
-            self.max_lr = self.base_max_lr * (self.gamma ** self.cycle)
-
         cos = (1 + math.cos(math.pi * self.step_in_cycle / self.cycle_steps)) / 2
         lr = self.min_lr + (self.max_lr - self.min_lr) * cos
 
         for param_group in self.optimizer.param_groups:
             param_group['lr'] = lr
+
+        self.step_in_cycle += 1
+        if self.step_in_cycle >= self.cycle_steps:
+            self.cycle += 1
+            self.step_in_cycle = 0
+
+            # уменьшаем max_lr
+            self.max_lr = self.base_max_lr * (self.gamma ** self.cycle)
 
     def get_last_lr(self):
         return [self.optimizer.param_groups[0]['lr']]
@@ -733,8 +732,8 @@ def run_training():
         print(f"[Summary]   Val   Loss: {val_loss/val_loader_len:.4f} | Acc: {val_accuracy:.2f}%")
         print(f"[Summary]   Val Precision: {val_precision:.4f} | Recall: {val_recall:.4f} | F1: {val_f1:.4f}")
         print(f"[Time]      Epoch: {epoch_duration_str} | Total: {total_elapsed_str}")
-        print(f"[LR]        Current: {current_lr/config.max_lr:.2f} %")
-        print(f"[LR]        Next:    {next_lr/config.max_lr:.2f} %")
+        print(f"[LR]        Current: {current_lr/scheduler.max_lr:.2f} %")
+        print(f"[LR]        Next:    {next_lr/scheduler.max_lr:.2f} %")
 
         print()
 
